@@ -1,0 +1,2064 @@
+// icm42688_tests — the driver over a double of the part: a register file
+// with four banks that answers on an I2C bus and on an SPI bus the way
+// TDK's data sheet (DS-000347 revision 1.9, §§ 9 and 13 to 18) says an
+// ICM-42688-P does, so the register banks, the big-endian counts, every
+// conversion, the rates and power modes, the filters, the FIFO packets, the
+// self-tests and the bring-up are checked on the host, one transaction at a
+// time.  The log keeps what the controller sent, in a form the tests
+// compare.
+//
+// Log entries: an I2C write is 1, the address, the bytes sent, -1; an I2C
+// read is 2, the address, the register, the count, -1; an SPI transaction
+// is 3, the bytes the controller clocked out, -1.
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, BoardTimer, I2cBus, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_gyro.{ GyroMilliDps, GyroRange, Gyroscope }
+use dev_imu.{ ImuSample, Imu }
+use dev_thermo.{ TempMilliC, Thermometer }
+use dev_id.{ DeviceId, Identifiable }
+use icm42688
+use icm42688.{ Icm42688, Icm42688Spi, Icm42688Mode, Icm42688Port }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `regs` is the part's registers, keyed by 256 times the bank plus the
+// address (REG_BANK_SEL, 0x76, lives at its bank 0 key).  `st` is the
+// double's state: 0 is 0 before an SPI control byte and 1 after it, 1 the
+// register, 2 R/W, 4 1 when a part is there, 9 1 inside an SPI transaction,
+// 10 the bytes taken out of the FIFO, 11 the count latched by FIFO_COUNTH,
+// 20 and 21 the SPI clock and mode, 22 the I2C clock, 30 to 32 the counts
+// the accelerometer's self-test adds to X, Y and Z, 33 to 35 the
+// gyroscope's, 41 INT_STATUS, 43 1 to set DATA_RDY_INT on every read of it,
+// 44 and 45 the grants of that when 45 is 1, 50 the microseconds waited, 51
+// the waits, 66 the reads of INT_STATUS before a reset shows RESET_DONE,
+// 67 1 to keep no log, 70 the I2C address, 100 a WHO_AM_I that a reset
+// keeps, 98 the bytes in the FIFO and 99
+// the entries in the log.  `ro` lists registers (by key) that ignore a
+// write.  `fifo` holds the FIFO's bytes and `log` the log.
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    ro: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+    fifo: HashMap<Int, Int>
+
+@tier(app)
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// The registers as a reset leaves them (§§ 13 to 18).
+@tier(app)
+fn defaults(c: Chip)
+    for r in 0..1280
+        c.regs.insert(r, 0)
+    c.regs.insert(0x13, 0x05)
+    c.regs.insert(0x1D, 0x80)
+    c.regs.insert(0x1F, 0x80)
+    c.regs.insert(0x21, 0x80)
+    c.regs.insert(0x23, 0x80)
+    c.regs.insert(0x25, 0x80)
+    c.regs.insert(0x27, 0x80)
+    c.regs.insert(0x29, 0x80)
+    c.regs.insert(0x4C, 0x30)
+    c.regs.insert(0x4D, 0x91)
+    c.regs.insert(0x4F, 0x06)
+    c.regs.insert(0x50, 0x06)
+    c.regs.insert(0x51, 0x16)
+    c.regs.insert(0x52, 0x11)
+    c.regs.insert(0x53, 0x0D)
+    c.regs.insert(0x64, 0x10)
+    c.regs.insert(0x65, 0x10)
+    c.regs.insert(0x75, 0x47)
+    c.regs.insert(0x10B, 0xA0)
+    c.regs.insert(0x17C, 0x5F)
+    c.regs.insert(0x203, 0x30)
+    c.regs.insert(0x204, 0x40)
+    c.regs.insert(0x205, 0x62)
+
+// The chip with its reset values in place.
+@tier(app)
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(),
+        st: HashMap.new(),
+        ro: HashMap.new(),
+        log: HashMap.new(),
+        fifo: HashMap.new() }
+    defaults(c)
+    c.st.insert(4, 1)
+    c.st.insert(66, 2)
+    c.st.insert(70, 0x68)
+    c
+
+// Appends a value to the log, unless the test keeps none.
+@tier(app)
+fn log_push(c: Chip, v: Int)
+    if at(c.st, 67) == 1
+        return
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+// Empties the log.
+@tier(app)
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// The bank the part is in.
+@tier(app)
+fn bank_of(c: Chip) -> Int
+    at(c.regs, 0x76) & 7
+
+// The key of a register in the bank the part is in; REG_BANK_SEL is the
+// same in every bank.
+@tier(app)
+fn key_of(c: Chip, reg: Int) -> Int
+    if reg == 0x76
+        return 0x76
+    bank_of(c) * 256 + reg
+
+// The packet length FIFO_CONFIG1 selects.
+@tier(app)
+fn packet_len(c: Chip) -> Int
+    let f = at(c.regs, 0x5F)
+    if (f & 3) == 3
+        return 16
+    8
+
+// The FIFO is on in any mode but bypass.
+@tier(app)
+fn fifo_on(c: Chip) -> Bool
+    (at(c.regs, 0x16) & 0xC0) != 0
+
+// The packets that have not been taken.
+@tier(app)
+fn fifo_left(c: Chip) -> Int
+    (at(c.st, 98) - at(c.st, 10)) / packet_len(c)
+
+// The self-test's push for an axis of the accelerometer (a register 0x1F
+// to 0x24) or of the gyroscope (0x25 to 0x2A): the part's amount while the
+// self-test is on.
+@tier(app)
+fn st_push(c: Chip, reg: Int) -> Int
+    let cfg = at(c.regs, 0x70)
+    if reg >= 0x25
+        let axis = (reg - 0x25) / 2
+        if (cfg & (1 << axis)) != 0
+            return at(c.st, 33 + axis)
+        return 0
+    let axis = (reg - 0x1F) / 2
+    if (cfg & 0x40) != 0 and (cfg & (8 << axis)) != 0
+        return at(c.st, 30 + axis)
+    0
+
+// A data register 0x1D to 0x2A: the stored count plus the self-test's push,
+// one byte of it, high byte first.
+@tier(app)
+fn out_read(c: Chip, reg: Int) -> Int
+    let lo = 0x1D + (reg - 0x1D) / 2 * 2
+    var v = at(c.regs, lo) * 256 + at(c.regs, lo + 1)
+    if v >= 32768
+        v = v - 65536
+    if reg >= 0x1F and v != -32768
+        v = v + st_push(c, reg)
+    let u = v & 0xFFFF
+    if (reg - 0x1D) % 2 == 0
+        return (u >> 8) & 0xFF
+    u & 0xFF
+
+// INT_STATUS as the part answers it; the flags clear on the read.
+@tier(app)
+fn status_read(c: Chip) -> Int
+    var v = at(c.st, 41)
+    c.st.insert(41, 0)
+    if at(c.st, 43) == 1
+        if at(c.st, 45) == 0
+            v = v | 0x08
+        elif at(c.st, 44) > 0
+            c.st.insert(44, at(c.st, 44) - 1)
+            v = v | 0x08
+    v
+
+// A register as the part answers it.
+@tier(app)
+fn chip_read(c: Chip, reg: Int) -> Int
+    if reg == 0x2D and bank_of(c) == 0
+        return status_read(c)
+    if bank_of(c) == 0 and reg == 0x2E
+        let n = fifo_left(c)
+        c.st.insert(11, n)
+        return (n >> 8) & 0xFF
+    if bank_of(c) == 0 and reg == 0x2F
+        return at(c.st, 11) & 0xFF
+    if bank_of(c) == 0 and reg == 0x30
+        if not fifo_on(c) or at(c.st, 10) >= at(c.st, 98)
+            return 0xFF
+        let v = at(c.fifo, at(c.st, 10))
+        c.st.insert(10, at(c.st, 10) + 1)
+        return v
+    if bank_of(c) == 0 and reg >= 0x1D and reg <= 0x2A
+        return out_read(c, reg)
+    at(c.regs, key_of(c, reg))
+
+// A write to a register, which a read-only one ignores.  The soft reset
+// puts the registers back to their defaults and shows RESET_DONE after the
+// reads in key 66; a write of FIFO_FLUSH, or a FIFO in bypass, empties the
+// FIFO.
+@tier(app)
+fn chip_write(c: Chip, reg: Int, v: Int)
+    let k = key_of(c, reg)
+    if at(c.ro, k) == 1
+        return
+    if k == 0x11 and (v & 0x01) != 0
+        defaults(c)
+        if at(c.st, 100) != 0
+            c.regs.insert(0x75, at(c.st, 100))
+        c.st.insert(41, 0)
+        c.st.insert(60, at(c.st, 66))
+        c.st.insert(10, at(c.st, 98))
+        return
+    if k == 0x4B
+        if (v & 0x02) != 0
+            c.st.insert(10, at(c.st, 98))
+        return
+    c.regs.insert(k, v & 0xFF)
+    if k == 0x16 and (v & 0xC0) == 0
+        c.st.insert(10, at(c.st, 98))
+
+// Whether a register advances the address in a multiple-byte transfer: all
+// do but the FIFO port.
+@tier(app)
+fn inc_of(c: Chip, reg: Int) -> Int
+    if bank_of(c) == 0 and reg == 0x30
+        return 0
+    1
+
+// After a soft reset the first reads of INT_STATUS show no RESET_DONE: the
+// count is in key 60.
+@tier(app)
+fn reset_pending(c: Chip) -> Bool
+    at(c.st, 60) > 0
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    @tier(app)
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(22, freq)
+
+    @tier(app)
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.c, 1)
+        log_push(self.c, addr)
+        for b in data
+            log_push(self.c, b as Int)
+        log_push(self.c, -1)
+        if addr != at(self.c.st, 70) or at(self.c.st, 4) == 0 or data.len() < 2
+            return false
+        var r = data[0] as Int
+        for i in 1..data.len()
+            chip_write(self.c, r, data[i] as Int)
+            r = r + inc_of(self.c, r)
+        true
+
+    @tier(app)
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        log_push(self.c, 2)
+        log_push(self.c, addr)
+        log_push(self.c, tx[0] as Int)
+        log_push(self.c, n)
+        log_push(self.c, -1)
+        if addr != at(self.c.st, 70) or at(self.c.st, 4) == 0
+            return None
+        var r = tx[0] as Int
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, read_one(self.c, r) as u8)
+            r = r + inc_of(self.c, r)
+        Some(out)
+
+// One register read, in which INT_STATUS shows RESET_DONE only once the
+// reads of key 66 have gone by after a reset.
+@tier(app)
+fn read_one(c: Chip, reg: Int) -> Int
+    if reg == 0x2D and bank_of(c) == 0 and reset_pending(c)
+        c.st.insert(60, at(c.st, 60) - 1)
+        if at(c.st, 60) == 0
+            c.st.insert(41, 0x10)
+    chip_read(c, reg)
+
+struct FakeSpi
+    c: Chip
+
+impl SpiBus for FakeSpi
+    @tier(app)
+    fn init(self, freq: Int, mode: Int) [hw]
+        self.c.st.insert(20, freq)
+        self.c.st.insert(21, mode)
+
+    @tier(app)
+    fn transfer(self, b: Int) -> Int [hw]
+        if at(self.c.st, 9) == 1
+            log_push(self.c, b)
+        if at(self.c.st, 4) == 0
+            return 0xFF
+        if at(self.c.st, 0) == 0
+            self.c.st.insert(0, 1)
+            self.c.st.insert(1, b & 0x7F)
+            self.c.st.insert(2, (b >> 7) & 1)
+            return 0xFF
+        let r = at(self.c.st, 1)
+        self.c.st.insert(1, (r + inc_of(self.c, r)) & 0x7F)
+        if at(self.c.st, 2) == 1
+            return read_one(self.c, r)
+        chip_write(self.c, r, b)
+        0xFF
+
+    @tier(app)
+    fn write(self, data: [u8]) [hw]
+        for b in data
+            let _ = self.transfer(b as Int)
+
+    @tier(app)
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, self.transfer(0xFF) as u8)
+        out
+
+// The GPIO double: the chip select (pin 67) falling starts an SPI
+// transaction and rising ends it.
+struct FakePins
+    c: Chip
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    @tier(app)
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    @tier(app)
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        if pin == 67 and val == 0
+            self.c.st.insert(0, 0)
+            self.c.st.insert(9, 1)
+            log_push(self.c, 3)
+        if pin == 67 and val == 1 and at(self.c.st, 9) == 1
+            self.c.st.insert(9, 0)
+            log_push(self.c, -1)
+
+    @tier(app)
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+@tier(app)
+fn pins(c: Chip) -> FakePins
+    FakePins { c: c, levels: HashMap.new(), modes: HashMap.new() }
+
+// Counts a wait.
+@tier(app)
+fn waited(c: Chip, us: Int)
+    c.st.insert(50, at(c.st, 50) + us)
+    c.st.insert(51, at(c.st, 51) + 1)
+
+// The two ports, as a type that holds a bus implements them: every method
+// is the package's own function over the double.
+struct I2cDut
+    bus: FakeI2c
+    pins: FakePins
+    w: DeviceWiring
+
+impl Icm42688Port for I2cDut
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        icm42688.i2c_setup(self.bus, self.pins, self.w)
+
+    @tier(app)
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        icm42688.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    @tier(app)
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        icm42688.i2c_write(self.bus, self.w, reg, v)
+
+    @tier(app)
+    fn irq_level(self) -> Int [hw]
+        icm42688.irq_level_of(self.pins, self.w)
+
+    @tier(app)
+    fn on_spi(self) -> Bool [hw]
+        false
+
+    @tier(app)
+    fn wait_us(self, us: Int) [hw]
+        waited(self.bus.c, us)
+
+struct SpiDut
+    bus: FakeSpi
+    pins: FakePins
+    w: DeviceWiring
+
+impl Icm42688Port for SpiDut
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        icm42688.spi_setup(self.bus, self.pins, self.w)
+
+    @tier(app)
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        icm42688.spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
+
+    @tier(app)
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        icm42688.spi_write(self.bus, self.pins, self.w, reg, v)
+
+    @tier(app)
+    fn irq_level(self) -> Int [hw]
+        icm42688.irq_level_of(self.pins, self.w)
+
+    @tier(app)
+    fn on_spi(self) -> Bool [hw]
+        true
+
+    @tier(app)
+    fn wait_us(self, us: Int) [hw]
+        waited(self.bus.c, us)
+
+// A port that refuses one chosen write or one chosen read of a chosen
+// register: `fail` maps a register to the number of the write, counted from
+// 1, that the bus refuses, and `seen` counts the writes; `rfail` and
+// `rseen` do the same for reads.  `quiet` limits the reads of FIFO_DATA to
+// the number in key 0 once key 1 is 1.  It reaches the refusals that a
+// read-only register cannot, such as the second write of a register.
+struct Flaky
+    inner: I2cDut
+    fail: HashMap<Int, Int>
+    seen: HashMap<Int, Int>
+    rfail: HashMap<Int, Int>
+    rseen: HashMap<Int, Int>
+    quiet: HashMap<Int, Int>
+
+impl Icm42688Port for Flaky
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
+
+    @tier(app)
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        let k = at(self.rseen, reg) + 1
+        self.rseen.insert(reg, k)
+        if at(self.rfail, reg) == k
+            dst.clear()
+            return false
+        if reg == 0x30 and at(self.quiet, 1) == 1
+            if at(self.quiet, 0) == 0
+                dst.clear()
+                return false
+            self.quiet.insert(0, at(self.quiet, 0) - 1)
+        self.inner.read_regs(reg, n, var dst)
+
+    @tier(app)
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        let n = at(self.seen, reg) + 1
+        self.seen.insert(reg, n)
+        if at(self.fail, reg) == n
+            return false
+        self.inner.write_reg(reg, v)
+
+    @tier(app)
+    fn irq_level(self) -> Int [hw]
+        self.inner.irq_level()
+
+    @tier(app)
+    fn on_spi(self) -> Bool [hw]
+        self.inner.on_spi()
+
+    @tier(app)
+    fn wait_us(self, us: Int) [hw]
+        self.inner.wait_us(us)
+
+@tier(app)
+fn flaky(c: Chip) -> Flaky
+    Flaky { inner: i2c_dut(c),
+        fail: HashMap.new(),
+        seen: HashMap.new(),
+        rfail: HashMap.new(),
+        rseen: HashMap.new(),
+        quiet: HashMap.new() }
+
+@tier(app)
+fn flaky_write(c: Chip, reg: Int, nth: Int) -> Flaky
+    let f = flaky(c)
+    f.fail.insert(reg, nth)
+    f
+
+@tier(app)
+fn flaky_read(c: Chip, reg: Int, nth: Int) -> Flaky
+    let f = flaky(c)
+    f.rfail.insert(reg, nth)
+    f
+
+// The board's wiring: the part at 0x68 on I2C, INT1 on pin 65.
+@tier(app)
+fn i2c_wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x68), 65)
+
+// The part on SPI: chip select on pin 67, INT1 on pin 65.
+@tier(app)
+fn spi_wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_spi(0, 67), 65)
+
+@tier(app)
+fn i2c_dut(c: Chip) -> I2cDut
+    I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: i2c_wiring() }
+
+@tier(app)
+fn spi_dut(c: Chip) -> SpiDut
+    SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: spi_wiring() }
+
+// Asserts the log holds exactly `want`, then empties it.
+@tier(app)
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+// A register of bank 0, by its address.
+@tier(app)
+fn reg_of(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+// A register of a bank.
+@tier(app)
+fn bank_reg_of(c: Chip, bank: Int, r: Int) -> Int
+    at(c.regs, bank * 256 + r)
+
+// Sets the 16-bit count of an axis, high byte first, at `reg`.
+@tier(app)
+fn put16(c: Chip, reg: Int, v: Int)
+    let u = v & 0xFFFF
+    c.regs.insert(reg, u >> 8)
+    c.regs.insert(reg + 1, u & 0xFF)
+
+// Sets the accelerometer's three axes (0x1F), then the gyroscope's (0x25).
+@tier(app)
+fn put_accel(c: Chip, x: Int, y: Int, z: Int)
+    put16(c, 0x1F, x)
+    put16(c, 0x21, y)
+    put16(c, 0x23, z)
+
+@tier(app)
+fn put_gyro(c: Chip, x: Int, y: Int, z: Int)
+    put16(c, 0x25, x)
+    put16(c, 0x27, y)
+    put16(c, 0x29, z)
+
+// Appends a byte to the FIFO.
+@tier(app)
+fn fifo_byte(c: Chip, v: Int)
+    let n = at(c.st, 98)
+    c.fifo.insert(n, v & 0xFF)
+    c.st.insert(98, n + 1)
+
+@tier(app)
+fn fifo_s16(c: Chip, v: Int)
+    let u = v & 0xFFFF
+    fifo_byte(c, u >> 8)
+    fifo_byte(c, u & 0xFF)
+
+// Appends a 16-byte packet of both sensors: the header 0x68, three counts
+// of the accelerometer, three of the gyroscope, the temperature byte and
+// the timestamp.
+@tier(app)
+fn fifo_both(c: Chip, ax: Int, ay: Int, az: Int, gx: Int, gy: Int, gz: Int)
+    fifo_byte(c, 0x68)
+    for v in [ax, ay, az, gx, gy, gz]
+        fifo_s16(c, v)
+    fifo_byte(c, 0x20)
+    fifo_s16(c, 0x1234)
+
+// Appends an 8-byte packet of one sensor, the accelerometer's (header
+// 0x40) or the gyroscope's (0x20).
+@tier(app)
+fn fifo_one(c: Chip, header: Int, x: Int, y: Int, z: Int)
+    fifo_byte(c, header)
+    for v in [x, y, z]
+        fifo_s16(c, v)
+    fifo_byte(c, 0x20)
+
+@tier(app)
+fn x_of(o: ?AccelMilliG) -> Int
+    match o
+        Some(a) => a.x
+        None    => -99999
+
+@tier(app)
+fn y_of(o: ?AccelMilliG) -> Int
+    match o
+        Some(a) => a.y
+        None    => -99999
+
+@tier(app)
+fn z_of(o: ?AccelMilliG) -> Int
+    match o
+        Some(a) => a.z
+        None    => -99999
+
+@tier(app)
+fn gx_of(o: ?GyroMilliDps) -> Int
+    match o
+        Some(g) => g.x
+        None    => -99999
+
+@tier(app)
+fn gy_of(o: ?GyroMilliDps) -> Int
+    match o
+        Some(g) => g.y
+        None    => -99999
+
+@tier(app)
+fn gz_of(o: ?GyroMilliDps) -> Int
+    match o
+        Some(g) => g.z
+        None    => -99999
+
+// The log of an SPI read: the control byte, then `n` bytes of 0xFF, which
+// is what the controller clocks out while it reads.
+@tier(app)
+fn spi_read_log(cmd: Int, n: Int) -> [Int]
+    var out: [Int] = [3, cmd]
+    for _i in 0..n
+        list.push(out, 0xFF)
+    list.push(out, -1)
+    out
+
+// The registers written, in order, from a log of I2C transactions.
+@tier(app)
+fn written(c: Chip) -> [Int]
+    var out: [Int] = []
+    var i = 0
+    while i < at(c.st, 99)
+        let kind = at(c.log, i)
+        if kind == 1
+            list.push(out, at(c.log, i + 2))
+        i = i + 1
+        while i < at(c.st, 99) and at(c.log, i - 1) != -1
+            i = i + 1
+    out
+
+// ── The two buses' framing ───────────────────────────────────────────
+
+@test
+fn test_an_i2c_read_is_the_register_and_a_repeated_start_for_any_count() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(icm42688.reg_read(d, 0x75) ?? -1, 0x47)
+    log_is(c, [2, 0x68, 0x75, 1, -1])
+    c.regs.insert(0x2A, 11)
+    c.regs.insert(0x2B, 22)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x2A, 2, var b))
+    log_is(c, [2, 0x68, 0x2A, 2, -1])
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+
+@test
+fn test_an_i2c_write_is_the_register_then_the_byte() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(d.write_reg(0x4E, 0x0F))
+    log_is(c, [1, 0x68, 0x4E, 0x0F, -1])
+    test.assert_eq(reg_of(c, 0x4E), 0x0F)
+
+@test
+fn test_a_missing_i2c_part_does_not_answer() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(icm42688.reg_read(d, 0x75) == None)
+    test.assert(not d.write_reg(0x4E, 1))
+    test.assert(not icm42688.reg_write(d, 0x4E, 1))
+    test.assert(not icm42688.reg_update(d, 0x4E, 1, 1))
+    test.assert(icm42688.id_read(d) == None)
+
+@test
+fn test_an_spi_read_sets_rw_and_carries_no_dummy_byte() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert_eq(icm42688.reg_read(d, 0x75) ?? -1, 0x47)
+    log_is(c, [3, 0xF5, 0xFF, -1])
+    test.assert_eq(at(d.pins.levels, 67), 1)
+    c.regs.insert(0x2A, 11)
+    c.regs.insert(0x2B, 22)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x2A, 2, var b))
+    log_is(c, [3, 0xAA, 0xFF, 0xFF, -1])
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+
+@test
+fn test_an_spi_write_clears_rw() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(d.write_reg(0x4E, 0x0F))
+    log_is(c, [3, 0x4E, 0x0F, -1])
+    test.assert_eq(reg_of(c, 0x4E), 0x0F)
+
+@test
+fn test_an_spi_part_that_is_not_there_reads_0xff_and_is_no_part() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = spi_dut(c)
+    test.assert_eq(icm42688.reg_read(d, 0x75) ?? -1, 0xFF)
+    test.assert(icm42688.id_read(d) == None)
+    c.st.insert(4, 1)
+    c.regs.insert(0x75, 0)
+    test.assert(icm42688.id_read(d) == None)
+
+@test
+fn test_a_wiring_with_no_chip_select_runs_no_spi_transaction() [io, hw]
+    let c = chip()
+    let d = SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: dev_bus.wiring_i2c(0, 0x68) }
+    var b: DevBytes = Vec.new()
+    test.assert(not d.read_regs(0x75, 1, var b))
+    test.assert(not d.write_reg(0x4E, 1))
+    test.assert(not d.setup())
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_wiring_with_no_address_is_not_an_i2c_part() [io, hw]
+    let c = chip()
+    let d = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: dev_bus.wiring_spi(0, 67) }
+    test.assert(not d.setup())
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_the_fifo_port_does_not_advance_the_address_and_the_others_do() [io, hw]
+    // The pitfall FIFO_DATA is: a burst from it reads the port again and
+    // again, where a burst from a data register walks on.
+    let c = chip()
+    c.regs.insert(0x16, 0x40)
+    c.regs.insert(0x5F, 0x01)
+    fifo_one(c, 0x40, 1, 2, 3)
+    var b: DevBytes = Vec.new()
+    test.assert(i2c_dut(c).read_regs(0x30, 4, var b))
+    test.assert_eq(b[0] as Int, 0x40)
+    test.assert_eq(b[2] as Int, 0x01)
+    test.assert(spi_dut(c).read_regs(0x30, 2, var b))
+    test.assert_eq(b[0] as Int, 0x02)
+
+// ── Setup ────────────────────────────────────────────────────────────
+
+@test
+fn test_i2c_setup_makes_the_interrupt_pin_an_input_and_the_bus_fast() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(c.st, 22), 400000)
+    test.assert_eq(at(d.pins.modes, 65), 0)
+
+@test
+fn test_spi_setup_drives_chip_select_high_before_it_is_an_output() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(d.pins.levels, 67), 1)
+    test.assert_eq(at(d.pins.modes, 67), 1)
+    test.assert_eq(at(d.pins.modes, 65), 0)
+    test.assert_eq(at(c.st, 20), 4000000)
+    test.assert_eq(at(c.st, 21), 3)
+
+@test
+fn test_the_interrupt_line_level() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    d.pins.levels.insert(65, 1)
+    test.assert_eq(d.irq_level(), 1)
+    test.assert_eq(icm42688.irq_level_of(d.pins, dev_bus.wiring_i2c(0, 0x68)), -1)
+    let s = spi_dut(c)
+    s.pins.levels.insert(65, 1)
+    test.assert_eq(s.irq_level(), 1)
+
+@test
+fn test_a_wait_reaches_the_port() [io, hw]
+    let c = chip()
+    i2c_dut(c).wait_us(250)
+    spi_dut(c).wait_us(50)
+    test.assert_eq(at(c.st, 50), 300)
+    test.assert_eq(at(c.st, 51), 2)
+
+// ── Identity ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_identity_is_who_am_i_on_both_buses() [io, hw]
+    let c = chip()
+    match icm42688.id_read(i2c_dut(c))
+        Some(id) =>
+            test.assert_eq(id.who, 0x47)
+            test.assert(id.rev == None)
+        None     => test.assert(false)
+    match icm42688.id_read(spi_dut(c))
+        Some(id) => test.assert_eq(id.who, 0x47)
+        None     => test.assert(false)
+
+// ── The register banks ───────────────────────────────────────────────
+
+@test
+fn test_a_bank_is_selected_by_reg_bank_sel_and_five_banks_exist() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    log_clear(c)
+    test.assert(icm42688.bank_set(d, 2))
+    log_is(c, [1, 0x68, 0x76, 2, -1, 2, 0x68, 0x76, 1, -1])
+    test.assert_eq(bank_of(c), 2)
+    test.assert(icm42688.bank_set(d, 0))
+    test.assert(not icm42688.bank_set(d, 5))
+    test.assert(not icm42688.bank_set(d, -1))
+    test.assert_eq(bank_of(c), 0)
+
+@test
+fn test_a_register_of_bank_1_is_read_and_bank_0_is_put_back() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(icm42688.bank_read(d, 1, 0x7C) ?? -1, 0x5F)
+    test.assert_eq(bank_of(c), 0)
+    // Bank 0's register at the same address is another.
+    test.assert_eq(icm42688.reg_read(d, 0x7C) ?? -1, 0)
+
+@test
+fn test_a_visit_to_a_bank_puts_bank_0_back_also_when_it_failed() [io, hw]
+    // The read of the register fails: the bank comes back.
+    let c = chip()
+    let f = flaky_read(c, 0x7C, 1)
+    test.assert(icm42688.bank_read(f, 1, 0x7C) == None)
+    test.assert_eq(bank_of(c), 0)
+    // The selection of the bank fails to read back: the bank is selected,
+    // and is put back.
+    let e = chip()
+    e.ro.insert(0x76, 1)
+    test.assert(icm42688.bank_read(i2c_dut(e), 1, 0x7C) == None)
+    // The restore fails: the answer is None.
+    let g = chip()
+    let h = flaky_write(g, 0x76, 2)
+    test.assert(icm42688.bank_read(h, 1, 0x7C) == None)
+    // The same for an update.
+    let i = chip()
+    test.assert(icm42688.bank_update(i2c_dut(i), 1, 0x7C, 0x13, 0x10))
+    test.assert_eq(bank_reg_of(i, 1, 0x7C), 0x5C)
+    test.assert_eq(bank_of(i), 0)
+    let j = chip()
+    test.assert(not icm42688.bank_update(flaky_read(j, 0x7C, 1), 1, 0x7C, 0x13, 0x10))
+    test.assert_eq(bank_of(j), 0)
+    let k = chip()
+    k.ro.insert(0x76, 1)
+    test.assert(not icm42688.bank_update(i2c_dut(k), 1, 0x7C, 0x13, 0x10))
+    let l = chip()
+    test.assert(not icm42688.bank_update(flaky_write(l, 0x76, 2), 1, 0x7C, 0x13, 0x10))
+
+// ── Ranges and steps ─────────────────────────────────────────────────
+
+@test
+fn test_the_accelerometer_range_codes_run_from_the_widest_down() [io, hw]
+    // Table 2 and § 14.38: 000 ±16 g, 001 ±8 g, 010 ±4 g, 011 ±2 g.
+    test.assert(icm42688.accel_range_of(0x06) == AccelRange16g)
+    test.assert(icm42688.accel_range_of(0x26) == AccelRange8g)
+    test.assert(icm42688.accel_range_of(0x46) == AccelRange4g)
+    test.assert(icm42688.accel_range_of(0x66) == AccelRange2g)
+    // A reserved code reads as ±2 g.
+    test.assert(icm42688.accel_range_of(0x86) == AccelRange2g)
+    test.assert_eq(icm42688.accel_fs_of(AccelRange16g), 0)
+    test.assert_eq(icm42688.accel_fs_of(AccelRange8g), 1)
+    test.assert_eq(icm42688.accel_fs_of(AccelRange4g), 2)
+    test.assert_eq(icm42688.accel_fs_of(AccelRange2g), 3)
+
+@test
+fn test_the_gyroscope_range_codes_and_the_ranges_below_250_dps() [io, hw]
+    test.assert(icm42688.gyro_range_of(0x06) == GyroRange2000dps)
+    test.assert(icm42688.gyro_range_of(0x26) == GyroRange1000dps)
+    test.assert(icm42688.gyro_range_of(0x46) == GyroRange500dps)
+    test.assert(icm42688.gyro_range_of(0x66) == GyroRange250dps)
+    // ±125, ±62.5, ±31.25 and ±15.625 dps read as the narrowest value.
+    test.assert(icm42688.gyro_range_of(0x86) == GyroRange250dps)
+    test.assert(icm42688.gyro_range_of(0xE6) == GyroRange250dps)
+    test.assert_eq(icm42688.gyro_fs_of(GyroRange2000dps), 0)
+    test.assert_eq(icm42688.gyro_fs_of(GyroRange1000dps), 1)
+    test.assert_eq(icm42688.gyro_fs_of(GyroRange500dps), 2)
+    test.assert_eq(icm42688.gyro_fs_of(GyroRange250dps), 3)
+
+@test
+fn test_the_sensitivities_are_table_1s_and_2s() [io, hw]
+    test.assert_eq(icm42688.lsb_per_g(0x06), 2048)
+    test.assert_eq(icm42688.lsb_per_g(0x26), 4096)
+    test.assert_eq(icm42688.lsb_per_g(0x46), 8192)
+    test.assert_eq(icm42688.lsb_per_g(0x66), 16384)
+    test.assert_eq(icm42688.tenth_lsb_per_dps(0x06), 164)
+    test.assert_eq(icm42688.tenth_lsb_per_dps(0x26), 328)
+    test.assert_eq(icm42688.tenth_lsb_per_dps(0x46), 655)
+    test.assert_eq(icm42688.tenth_lsb_per_dps(0x66), 1310)
+    test.assert_eq(icm42688.tenth_lsb_per_dps(0x86), 2620)
+    test.assert_eq(icm42688.tenth_lsb_per_dps(0xA6), 5243)
+    test.assert_eq(icm42688.tenth_lsb_per_dps(0xC6), 10486)
+    test.assert_eq(icm42688.tenth_lsb_per_dps(0xE6), 20972)
+
+// ── Rates ────────────────────────────────────────────────────────────
+
+@test
+fn test_the_rate_codes_are_the_data_sheets_with_500_hz_out_of_order() [io, hw]
+    let want = [32000000, 16000000, 8000000, 4000000, 2000000, 1000000, 200000, 100000, 50000, 25000, 12500]
+    for i in 0..want.len()
+        test.assert_eq(icm42688.mhz_of_odr(i + 1, true), want[i])
+        test.assert_eq(icm42688.mhz_of_odr(i + 1, false), want[i])
+    test.assert_eq(icm42688.mhz_of_odr(15, true), 500000)
+    test.assert_eq(icm42688.mhz_of_odr(15, false), 500000)
+    // The accelerometer's low-power rates; the gyroscope has none.
+    test.assert_eq(icm42688.mhz_of_odr(12, true), 6250)
+    test.assert_eq(icm42688.mhz_of_odr(13, true), 3125)
+    test.assert_eq(icm42688.mhz_of_odr(14, true), 1563)
+    test.assert_eq(icm42688.mhz_of_odr(12, false), 0)
+    test.assert_eq(icm42688.mhz_of_odr(13, false), 0)
+    test.assert_eq(icm42688.mhz_of_odr(14, false), 0)
+    test.assert_eq(icm42688.mhz_of_odr(0, true), 0)
+
+@test
+fn test_a_requested_rate_rounds_up_to_a_code_the_mode_can_run() [io, hw]
+    // Low noise accelerometer and the gyroscope: 12.5 Hz and above.
+    test.assert_eq(icm42688.odr_code_for(1, true, false), 11)
+    test.assert_eq(icm42688.odr_code_for(12500, true, false), 11)
+    test.assert_eq(icm42688.odr_code_for(12501, true, false), 10)
+    test.assert_eq(icm42688.odr_code_for(100000, true, false), 8)
+    test.assert_eq(icm42688.odr_code_for(100001, true, false), 7)
+    test.assert_eq(icm42688.odr_code_for(200001, true, false), 15)
+    test.assert_eq(icm42688.odr_code_for(500001, true, false), 6)
+    test.assert_eq(icm42688.odr_code_for(32000000, true, false), 1)
+    test.assert_eq(icm42688.odr_code_for(99999999, true, false), 1)
+    test.assert_eq(icm42688.odr_code_for(1, false, false), 11)
+    test.assert_eq(icm42688.odr_code_for(500000, false, false), 15)
+    // Low power: 1.5625 Hz to 500 Hz.
+    test.assert_eq(icm42688.odr_code_for(1, true, true), 14)
+    test.assert_eq(icm42688.odr_code_for(1563, true, true), 14)
+    test.assert_eq(icm42688.odr_code_for(1564, true, true), 13)
+    test.assert_eq(icm42688.odr_code_for(6250, true, true), 12)
+    test.assert_eq(icm42688.odr_code_for(500000, true, true), 15)
+    test.assert_eq(icm42688.odr_code_for(500001, true, true), 15)
+
+@test
+fn test_a_rate_in_whole_hertz_is_rounded_and_zero_when_off() [io, hw]
+    test.assert_eq(icm42688.hz_of_mhz(0), 0)
+    test.assert_eq(icm42688.hz_of_mhz(-1), 0)
+    test.assert_eq(icm42688.hz_of_mhz(1563), 2)
+    test.assert_eq(icm42688.hz_of_mhz(12500), 13)
+    test.assert_eq(icm42688.hz_of_mhz(100000), 100)
+    test.assert_eq(icm42688.hz_of_mhz(32000000), 32000)
+
+// ── Samples ──────────────────────────────────────────────────────────
+
+@test
+fn test_an_acceleration_is_converted_at_each_range() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // ±16 g after a reset: 2,048 counts a g.
+    put_accel(c, 2048, -4096, 1)
+    test.assert_eq(x_of(icm42688.accel_read_of(d)), 1000)
+    test.assert_eq(y_of(icm42688.accel_read_of(d)), -2000)
+    test.assert_eq(z_of(icm42688.accel_read_of(d)), 0)
+    // ±8 g, ±4 g and ±2 g.
+    c.regs.insert(0x50, 0x26)
+    test.assert_eq(x_of(icm42688.accel_read_of(d)), 500)
+    c.regs.insert(0x50, 0x46)
+    test.assert_eq(x_of(icm42688.accel_read_of(d)), 250)
+    c.regs.insert(0x50, 0x66)
+    test.assert_eq(x_of(icm42688.accel_read_of(d)), 125)
+    put_accel(c, 16384, -16384, 3)
+    test.assert_eq(x_of(icm42688.accel_read_of(d)), 1000)
+    test.assert_eq(y_of(icm42688.accel_read_of(d)), -1000)
+    test.assert_eq(z_of(icm42688.accel_read_of(d)), 0)
+
+@test
+fn test_the_largest_counts_reach_the_full_scale() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    put_accel(c, 32767, -32767, 0)
+    test.assert_eq(x_of(icm42688.accel_read_of(d)), 15999)
+    test.assert_eq(y_of(icm42688.accel_read_of(d)), -15999)
+
+@test
+fn test_a_rate_of_turn_is_converted_at_each_range() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // ±2000 dps after a reset: 16.4 counts a degree per second.
+    put_gyro(c, 164, -328, 1)
+    test.assert_eq(gx_of(icm42688.gyro_read_of(d)), 10000)
+    test.assert_eq(gy_of(icm42688.gyro_read_of(d)), -20000)
+    test.assert_eq(gz_of(icm42688.gyro_read_of(d)), 60)
+    c.regs.insert(0x4F, 0x26)
+    put_gyro(c, 328, 0, 0)
+    test.assert_eq(gx_of(icm42688.gyro_read_of(d)), 10000)
+    c.regs.insert(0x4F, 0x46)
+    put_gyro(c, 655, 0, 0)
+    test.assert_eq(gx_of(icm42688.gyro_read_of(d)), 10000)
+    c.regs.insert(0x4F, 0x66)
+    put_gyro(c, 1310, 0, 0)
+    test.assert_eq(gx_of(icm42688.gyro_read_of(d)), 10000)
+    c.regs.insert(0x4F, 0x86)
+    put_gyro(c, 2620, 0, 0)
+    test.assert_eq(gx_of(icm42688.gyro_read_of(d)), 10000)
+    c.regs.insert(0x4F, 0xA6)
+    put_gyro(c, 5243, 0, 0)
+    test.assert_eq(gx_of(icm42688.gyro_read_of(d)), 10000)
+    c.regs.insert(0x4F, 0xC6)
+    put_gyro(c, 10486, 0, 0)
+    test.assert_eq(gx_of(icm42688.gyro_read_of(d)), 10000)
+    c.regs.insert(0x4F, 0xE6)
+    put_gyro(c, 20972, 0, 0)
+    test.assert_eq(gx_of(icm42688.gyro_read_of(d)), 10000)
+
+@test
+fn test_each_sample_is_the_ranges_then_one_burst_of_the_outputs() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    put_accel(c, 1000, 0, 0)
+    put_gyro(c, 1000, 0, 0)
+    log_clear(c)
+    let _a = icm42688.accel_read_of(d)
+    log_is(c, [2, 0x68, 0x4F, 2, -1, 2, 0x68, 0x1F, 6, -1])
+    let _g = icm42688.gyro_read_of(d)
+    log_is(c, [2, 0x68, 0x4F, 2, -1, 2, 0x68, 0x25, 6, -1])
+    let _i = icm42688.imu_read_of(d)
+    log_is(c, [2, 0x68, 0x4F, 2, -1, 2, 0x68, 0x1F, 12, -1])
+
+@test
+fn test_a_paired_sample_has_both_from_one_burst_at_their_own_ranges() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    put_accel(c, 2000, 0, 1000)
+    put_gyro(c, 655, -655, 0)
+    // The accelerometer at ±4 g and the gyroscope at ±500 dps.
+    c.regs.insert(0x50, 0x46)
+    c.regs.insert(0x4F, 0x46)
+    match icm42688.imu_read_of(d)
+        Some(s) =>
+            test.assert_eq(s.accel.x, 244)
+            test.assert_eq(s.accel.z, 122)
+            test.assert_eq(s.gyro.x, 10000)
+            test.assert_eq(s.gyro.y, -10000)
+        None    => test.assert(false)
+
+@test
+fn test_a_sample_over_spi_is_the_same_burst() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    put_accel(c, 2048, 0, 0)
+    put_gyro(c, 1000, 0, 0)
+    log_clear(c)
+    test.assert_eq(x_of(icm42688.accel_read_of(d)), 1000)
+    log_is(c, [3, 0xCF, 0xFF, 0xFF, -1, 3, 0x9F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, -1])
+
+@test
+fn test_a_sensor_with_no_sample_yet_gives_none() [io, hw]
+    // The data registers read -32768 until the first sample of a sensor
+    // (§ 14.34), and for a sensor that is off.
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.accel_read_of(d) == None)
+    test.assert(icm42688.gyro_read_of(d) == None)
+    test.assert(icm42688.imu_read_of(d) == None)
+    test.assert(icm42688.temp_read_of(d) == None)
+    // One axis invalid is enough.
+    put_accel(c, 1, 2, 3)
+    put_gyro(c, 1, 2, 3)
+    test.assert(icm42688.accel_read_of(d) != None)
+    put16(c, 0x23, -32768)
+    test.assert(icm42688.accel_read_of(d) == None)
+    put16(c, 0x23, 3)
+    put16(c, 0x27, -32768)
+    test.assert(icm42688.gyro_read_of(d) == None)
+    // The pair needs both.
+    test.assert(icm42688.imu_read_of(d) == None)
+    put16(c, 0x27, 2)
+    put16(c, 0x21, -32768)
+    test.assert(icm42688.imu_read_of(d) == None)
+    put16(c, 0x21, 2)
+    test.assert(icm42688.imu_read_of(d) != None)
+
+@test
+fn test_no_part_gives_no_sample_and_is_never_ready() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(icm42688.accel_read_of(d) == None)
+    test.assert(icm42688.gyro_read_of(d) == None)
+    test.assert(icm42688.imu_read_of(d) == None)
+    test.assert(not icm42688.data_ready_of(d))
+    test.assert(icm42688.int_status(d) == None)
+    test.assert(icm42688.temp_read_of(d) == None)
+    // A part that answers the ranges and then goes quiet.
+    let e = chip()
+    put_accel(e, 1, 2, 3)
+    put_gyro(e, 1, 2, 3)
+    test.assert(icm42688.accel_read_of(flaky_read(e, 0x1F, 1)) == None)
+    test.assert(icm42688.gyro_read_of(flaky_read(e, 0x25, 1)) == None)
+    test.assert(icm42688.imu_read_of(flaky_read(e, 0x1F, 1)) == None)
+
+@test
+fn test_ready_is_data_rdy_int_and_reading_it_clears_it() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(not icm42688.data_ready_of(d))
+    c.st.insert(41, 0x08)
+    test.assert(icm42688.data_ready_of(d))
+    // The read cleared it: the second of two calls answers false.
+    test.assert(not icm42688.data_ready_of(d))
+    c.st.insert(41, 0x0C)
+    test.assert_eq(icm42688.int_status(d) ?? -1, 0x0C)
+    test.assert_eq(icm42688.int_status(d) ?? -1, 0)
+    c.st.insert(41, 0x08)
+    test.assert(icm42688.data_ready_of(d))
+    c.st.insert(41, 0x08)
+    test.assert(icm42688.data_ready_of(d))
+
+@test
+fn test_the_temperature_is_132_48_counts_a_degree_from_25_degrees() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    put16(c, 0x1D, 0)
+    test.assert(icm42688.temp_read_of(d) == Some(TempMilliC { milli_c: 25000 }))
+    put16(c, 0x1D, 13248)
+    test.assert(icm42688.temp_read_of(d) == Some(TempMilliC { milli_c: 125000 }))
+    put16(c, 0x1D, -13248)
+    test.assert(icm42688.temp_read_of(d) == Some(TempMilliC { milli_c: -75000 }))
+    put16(c, 0x1D, 1)
+    test.assert(icm42688.temp_read_of(d) == Some(TempMilliC { milli_c: 25007 }))
+    put16(c, 0x1D, 6624)
+    test.assert(icm42688.temp_read_of(d) == Some(TempMilliC { milli_c: 75000 }))
+
+// ── Range, rate and power mode ───────────────────────────────────────
+
+@test
+fn test_a_range_is_changed_without_touching_the_rate() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x50, 0x08)
+    test.assert(icm42688.accel_range_write(d, AccelRange4g))
+    test.assert_eq(reg_of(c, 0x50), 0x48)
+    test.assert(icm42688.accel_range_read(d) == AccelRange4g)
+    test.assert(icm42688.accel_range_write(d, AccelRange16g))
+    test.assert_eq(reg_of(c, 0x50), 0x08)
+    c.regs.insert(0x4F, 0x09)
+    test.assert(icm42688.gyro_range_write(d, GyroRange500dps))
+    test.assert_eq(reg_of(c, 0x4F), 0x49)
+    test.assert(icm42688.gyro_range_read(d) == GyroRange500dps)
+
+@test
+fn test_the_gyroscope_codes_below_250_dps_are_set_by_code() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.gyro_fs_code_write(d, 4))
+    test.assert_eq(reg_of(c, 0x4F), 0x86)
+    test.assert(icm42688.gyro_fs_code_write(d, 7))
+    test.assert_eq(reg_of(c, 0x4F), 0xE6)
+    test.assert(icm42688.gyro_range_read(d) == GyroRange250dps)
+    test.assert(not icm42688.gyro_fs_code_write(d, 8))
+    test.assert(not icm42688.gyro_fs_code_write(d, -1))
+    test.assert_eq(reg_of(c, 0x4F), 0xE6)
+
+@test
+fn test_the_range_setters_answer_false_for_a_silent_part() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(not icm42688.accel_range_write(d, AccelRange4g))
+    test.assert(not icm42688.gyro_range_write(d, GyroRange500dps))
+    test.assert(not icm42688.gyro_fs_code_write(d, 5))
+    test.assert(icm42688.accel_range_read(d) == AccelRange2g)
+    test.assert(icm42688.gyro_range_read(d) == GyroRange250dps)
+
+@test
+fn test_the_accelerometer_rate_is_read_with_the_mode_it_depends_on() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // Off after a reset.
+    test.assert_eq(icm42688.accel_rate_read(d), 0)
+    // Low noise at 100 Hz.
+    c.regs.insert(0x4E, 0x03)
+    c.regs.insert(0x50, 0x68)
+    log_clear(c)
+    test.assert_eq(icm42688.accel_rate_read(d), 100000)
+    log_is(c, [2, 0x68, 0x4E, 3, -1])
+    // The code 01 turns it off as well.
+    c.regs.insert(0x4E, 0x01)
+    test.assert_eq(icm42688.accel_rate_read(d), 0)
+    // Low power at 1.5625 Hz.
+    c.regs.insert(0x4E, 0x02)
+    c.regs.insert(0x50, 0x6E)
+    test.assert_eq(icm42688.accel_rate_read(d), 1563)
+    c.st.insert(4, 0)
+    test.assert_eq(icm42688.accel_rate_read(d), -1)
+
+@test
+fn test_the_gyroscope_rate_is_zero_in_standby_and_off() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(icm42688.gyro_rate_read(d), 0)
+    c.regs.insert(0x4E, 0x04)
+    test.assert_eq(icm42688.gyro_rate_read(d), 0)
+    c.regs.insert(0x4E, 0x0C)
+    c.regs.insert(0x4F, 0x0F)
+    test.assert_eq(icm42688.gyro_rate_read(d), 500000)
+    c.st.insert(4, 0)
+    test.assert_eq(icm42688.gyro_rate_read(d), -1)
+
+@test
+fn test_setting_a_rate_turns_a_sensor_on_in_low_noise_mode_and_waits() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(icm42688.accel_rate_write(d, 100000), 100000)
+    test.assert_eq(reg_of(c, 0x50) & 0x0F, 8)
+    test.assert_eq(reg_of(c, 0x4E) & 3, 3)
+    test.assert_eq(at(c.st, 50), 200)
+    test.assert_eq(icm42688.gyro_rate_write(d, 1000000), 1000000)
+    test.assert_eq(reg_of(c, 0x4F) & 0x0F, 6)
+    test.assert_eq(reg_of(c, 0x4E) & 0x0C, 0x0C)
+    test.assert_eq(at(c.st, 50), 400)
+    // A rate between two rates rounds up.
+    test.assert_eq(icm42688.accel_rate_write(d, 150000), 200000)
+    test.assert_eq(icm42688.gyro_rate_write(d, 150000), 200000)
+    // The mode did not change, so no wait.
+    test.assert_eq(at(c.st, 50), 400)
+
+@test
+fn test_setting_a_rate_of_zero_turns_the_sensor_off() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x4E, 0x2F)
+    test.assert_eq(icm42688.accel_rate_write(d, 0), 0)
+    test.assert_eq(reg_of(c, 0x4E), 0x2C)
+    test.assert_eq(icm42688.gyro_rate_write(d, -3), 0)
+    test.assert_eq(reg_of(c, 0x4E), 0x20)
+    test.assert_eq(at(c.st, 50), 400)
+
+@test
+fn test_a_low_power_accelerometer_keeps_its_mode_and_its_rates() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x4E, 0x02)
+    test.assert_eq(icm42688.accel_rate_write(d, 1000), 1563)
+    test.assert_eq(reg_of(c, 0x4E) & 3, 2)
+    test.assert_eq(at(c.st, 50), 0)
+    // Above 500 Hz the fastest low-power rate is answered.
+    test.assert_eq(icm42688.accel_rate_write(d, 2000000), 500000)
+
+@test
+fn test_the_rate_setters_answer_minus_one_for_a_part_that_refuses() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert_eq(icm42688.accel_rate_write(d, 100000), -1)
+    test.assert_eq(icm42688.gyro_rate_write(d, 100000), -1)
+    // The three writes of a rate on a sensor that is off: the rate, then
+    // the mode; and the mode of a request of zero.
+    let e = chip()
+    test.assert_eq(icm42688.accel_rate_write(flaky_write(e, 0x50, 1), 100000), -1)
+    test.assert_eq(icm42688.accel_rate_write(flaky_write(e, 0x4E, 1), 100000), -1)
+    test.assert_eq(icm42688.accel_rate_write(flaky_write(e, 0x4E, 1), 0), -1)
+    test.assert_eq(icm42688.gyro_rate_write(flaky_write(e, 0x4F, 1), 100000), -1)
+    test.assert_eq(icm42688.gyro_rate_write(flaky_write(e, 0x4E, 1), 100000), -1)
+    test.assert_eq(icm42688.gyro_rate_write(flaky_write(e, 0x4E, 1), 0), -1)
+
+@test
+fn test_the_rates_in_whole_hertz_are_the_thousandths_rounded() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(icm42688.accel_rate_hz_write(d, 12), 13)
+    test.assert_eq(icm42688.accel_rate_hz_read(d), 13)
+    test.assert_eq(icm42688.gyro_rate_hz_write(d, 100), 100)
+    test.assert_eq(icm42688.gyro_rate_hz_read(d), 100)
+    test.assert_eq(icm42688.accel_rate_hz_read(d), 13)
+    test.assert_eq(icm42688.accel_rate_hz_write(d, 1000), 1000)
+    test.assert_eq(icm42688.gyro_rate_hz_read(d), 100)
+
+@test
+fn test_the_accelerometer_mode_is_read_and_written_with_a_wait() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.accel_mode_read(d) == Icm42688Mode.Icm42688Off)
+    test.assert(icm42688.accel_mode_write(d, Icm42688Mode.Icm42688LowNoise))
+    test.assert(icm42688.accel_mode_read(d) == Icm42688Mode.Icm42688LowNoise)
+    test.assert_eq(at(c.st, 50), 200)
+    test.assert(icm42688.accel_mode_write(d, Icm42688Mode.Icm42688LowPower))
+    test.assert(icm42688.accel_mode_read(d) == Icm42688Mode.Icm42688LowPower)
+    test.assert(icm42688.accel_mode_write(d, Icm42688Mode.Icm42688Off))
+    test.assert(icm42688.accel_mode_read(d) == Icm42688Mode.Icm42688Off)
+    // The accelerometer has no standby, and the other bits stay.
+    test.assert(not icm42688.accel_mode_write(d, Icm42688Mode.Icm42688Standby))
+    c.regs.insert(0x4E, 0x2C)
+    test.assert(icm42688.accel_mode_write(d, Icm42688Mode.Icm42688LowNoise))
+    test.assert_eq(reg_of(c, 0x4E), 0x2F)
+
+@test
+fn test_a_change_of_mode_moves_a_rate_the_new_mode_does_not_run() [io, hw]
+    // § 12.1: low power to low noise below 12.5 Hz raises the rate to 12.5 Hz;
+    // low noise to low power above 500 Hz lowers it to 500 Hz.
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x4E, 0x02)
+    c.regs.insert(0x50, 0x6C)
+    test.assert(icm42688.accel_mode_write(d, Icm42688Mode.Icm42688LowNoise))
+    test.assert_eq(reg_of(c, 0x50), 0x6B)
+    c.regs.insert(0x50, 0x65)
+    test.assert(icm42688.accel_mode_write(d, Icm42688Mode.Icm42688LowPower))
+    test.assert_eq(reg_of(c, 0x50), 0x6F)
+    // A rate both modes run stays.
+    c.regs.insert(0x50, 0x68)
+    test.assert(icm42688.accel_mode_write(d, Icm42688Mode.Icm42688LowNoise))
+    test.assert_eq(reg_of(c, 0x50), 0x68)
+    // Failures: the read of the rate, the correction, the mode.
+    let e = chip()
+    e.regs.insert(0x50, 0x6C)
+    test.assert(not icm42688.accel_mode_write(flaky_read(e, 0x50, 1), Icm42688Mode.Icm42688LowNoise))
+    test.assert(not icm42688.accel_mode_write(flaky_write(e, 0x50, 1), Icm42688Mode.Icm42688LowNoise))
+    test.assert(not icm42688.accel_mode_write(flaky_write(e, 0x4E, 1), Icm42688Mode.Icm42688LowNoise))
+    test.assert(not icm42688.accel_mode_write(flaky_write(e, 0x4E, 1), Icm42688Mode.Icm42688Off))
+
+@test
+fn test_the_gyroscope_mode_is_read_and_written_with_a_wait() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.gyro_mode_read(d) == Icm42688Mode.Icm42688Off)
+    test.assert(icm42688.gyro_mode_write(d, Icm42688Mode.Icm42688Standby))
+    test.assert(icm42688.gyro_mode_read(d) == Icm42688Mode.Icm42688Standby)
+    test.assert(icm42688.gyro_mode_write(d, Icm42688Mode.Icm42688LowNoise))
+    test.assert(icm42688.gyro_mode_read(d) == Icm42688Mode.Icm42688LowNoise)
+    test.assert_eq(at(c.st, 50), 400)
+    test.assert(icm42688.gyro_mode_write(d, Icm42688Mode.Icm42688Off))
+    test.assert(icm42688.gyro_mode_read(d) == Icm42688Mode.Icm42688Off)
+    // The gyroscope has no low-power mode.
+    test.assert(not icm42688.gyro_mode_write(d, Icm42688Mode.Icm42688LowPower))
+    c.st.insert(4, 0)
+    test.assert(not icm42688.gyro_mode_write(d, Icm42688Mode.Icm42688LowNoise))
+    test.assert(icm42688.gyro_mode_read(d) == Icm42688Mode.Icm42688Off)
+    test.assert(icm42688.accel_mode_read(d) == Icm42688Mode.Icm42688Off)
+
+@test
+fn test_the_temperature_sensor_is_switched_by_temp_dis() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x4E, 0x0F)
+    test.assert(icm42688.temp_enable(d, false))
+    test.assert_eq(reg_of(c, 0x4E), 0x2F)
+    test.assert(icm42688.temp_enable(d, true))
+    test.assert_eq(reg_of(c, 0x4E), 0x0F)
+
+// ── Filters ──────────────────────────────────────────────────────────
+
+@test
+fn test_the_anti_alias_table_is_the_data_sheets() [io, hw]
+    // The 3 dB bandwidth, DELTSQR and BITSHIFT of § 5.3 for a few rows,
+    // and the sums of all 63.
+    test.assert_eq(icm42688.aaf_bandwidth_hz(1), 42)
+    test.assert_eq(icm42688.aaf_bandwidth_hz(2), 84)
+    test.assert_eq(icm42688.aaf_bandwidth_hz(11), 488)
+    test.assert_eq(icm42688.aaf_bandwidth_hz(63), 3979)
+    test.assert_eq(icm42688.aaf_bandwidth_hz(0), 0)
+    test.assert_eq(icm42688.aaf_bandwidth_hz(64), 0)
+    test.assert_eq((icm42688.aaf_row(1) >> 4) & 0xFFF, 1)
+    test.assert_eq(icm42688.aaf_row(1) & 15, 15)
+    test.assert_eq((icm42688.aaf_row(11) >> 4) & 0xFFF, 122)
+    test.assert_eq(icm42688.aaf_row(11) & 15, 8)
+    test.assert_eq((icm42688.aaf_row(63) >> 4) & 0xFFF, 3968)
+    test.assert_eq(icm42688.aaf_row(63) & 15, 3)
+    var bw = 0
+    var sq = 0
+    var sh = 0
+    for d in 1..64
+        bw = bw + icm42688.aaf_bandwidth_hz(d)
+        sq = sq + ((icm42688.aaf_row(d) >> 4) & 0xFFF)
+        sh = sh + (icm42688.aaf_row(d) & 15)
+    test.assert_eq(bw, 111407)
+    test.assert_eq(sq, 85405)
+    test.assert_eq(sh, 360)
+
+@test
+fn test_the_accelerometer_filter_is_written_in_bank_2_and_bank_0_comes_back() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.accel_aaf_write(d, 11))
+    // DELT in bits 6:1 with the filter enabled, DELTSQR 122, BITSHIFT 8.
+    test.assert_eq(bank_reg_of(c, 2, 0x03), 22)
+    test.assert_eq(bank_reg_of(c, 2, 0x04), 122)
+    test.assert_eq(bank_reg_of(c, 2, 0x05), 0x80)
+    test.assert_eq(bank_of(c), 0)
+    test.assert(icm42688.accel_aaf_write(d, 63))
+    test.assert_eq(bank_reg_of(c, 2, 0x03), 126)
+    test.assert_eq(bank_reg_of(c, 2, 0x04), 3968 & 0xFF)
+    test.assert_eq(bank_reg_of(c, 2, 0x05), 0x3F)
+    test.assert(not icm42688.accel_aaf_write(d, 0))
+    test.assert(not icm42688.accel_aaf_write(d, 64))
+    test.assert(icm42688.accel_aaf_disable(d))
+    test.assert_eq(bank_reg_of(c, 2, 0x03), 127)
+    test.assert_eq(bank_of(c), 0)
+
+@test
+fn test_the_gyroscope_filter_is_written_in_bank_1_and_bank_0_comes_back() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x10B, 0xA2)
+    test.assert(icm42688.gyro_aaf_write(d, 11))
+    test.assert_eq(bank_reg_of(c, 1, 0x0B), 0xA0)
+    test.assert_eq(bank_reg_of(c, 1, 0x0C), 11)
+    test.assert_eq(bank_reg_of(c, 1, 0x0D), 122)
+    test.assert_eq(bank_reg_of(c, 1, 0x0E), 0x80)
+    test.assert_eq(bank_of(c), 0)
+    test.assert(not icm42688.gyro_aaf_write(d, 0))
+    test.assert(not icm42688.gyro_aaf_write(d, 64))
+    test.assert(icm42688.gyro_aaf_disable(d))
+    test.assert_eq(bank_reg_of(c, 1, 0x0B), 0xA2)
+    test.assert_eq(bank_of(c), 0)
+
+@test
+fn test_a_filter_write_that_fails_still_puts_bank_0_back() [io, hw]
+    let c = chip()
+    c.ro.insert(0x76, 1)
+    test.assert(not icm42688.accel_aaf_write(i2c_dut(c), 5))
+    test.assert(not icm42688.gyro_aaf_write(i2c_dut(c), 5))
+    let e = chip()
+    test.assert(not icm42688.accel_aaf_write(flaky_write(e, 0x04, 1), 5))
+    test.assert_eq(bank_of(e), 0)
+    test.assert(not icm42688.gyro_aaf_write(flaky_write(e, 0x0D, 1), 5))
+    test.assert_eq(bank_of(e), 0)
+    test.assert(not icm42688.gyro_aaf_write(flaky_write(e, 0x76, 2), 5))
+    test.assert(not icm42688.accel_aaf_write(flaky_write(e, 0x76, 2), 5))
+
+@test
+fn test_the_ui_filters_take_an_order_and_a_bandwidth_the_data_sheet_defines() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.ui_filter_order_write(d, 2, 1))
+    test.assert_eq(reg_of(c, 0x53), 0x15)
+    test.assert_eq(reg_of(c, 0x51), 0x16)
+    test.assert(icm42688.ui_filter_order_write(d, 0, 2))
+    test.assert_eq(reg_of(c, 0x53), 0x05)
+    test.assert_eq(reg_of(c, 0x51), 0x1A)
+    test.assert(not icm42688.ui_filter_order_write(d, 3, 0))
+    test.assert(not icm42688.ui_filter_order_write(d, -1, 0))
+    test.assert(not icm42688.ui_filter_order_write(d, 0, 3))
+    test.assert(not icm42688.ui_filter_order_write(d, 0, -1))
+    test.assert(icm42688.ui_filter_bw_write(d, 3, 14))
+    test.assert_eq(reg_of(c, 0x52), 0x3E)
+    test.assert(icm42688.ui_filter_bw_write(d, 15, 0))
+    test.assert_eq(reg_of(c, 0x52), 0xF0)
+    test.assert(icm42688.ui_filter_bw_write(d, 7, 7))
+    test.assert(not icm42688.ui_filter_bw_write(d, 8, 0))
+    test.assert(not icm42688.ui_filter_bw_write(d, 0, 13))
+    test.assert(not icm42688.ui_filter_bw_write(d, -1, 0))
+    test.assert(not icm42688.ui_filter_bw_write(d, 0, 16))
+    test.assert_eq(reg_of(c, 0x52), 0x77)
+    c.st.insert(4, 0)
+    test.assert(not icm42688.ui_filter_order_write(d, 1, 1))
+    test.assert(not icm42688.ui_filter_bw_write(d, 1, 1))
+
+// ── Interrupt pins ───────────────────────────────────────────────────
+
+@test
+fn test_the_routes_are_int_source0_and_int_source3() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.int1_route(d, icm42688.INT_DRDY | icm42688.INT_FIFO_THS))
+    test.assert_eq(reg_of(c, 0x65), 0x0C)
+    test.assert(icm42688.int2_route(d, icm42688.INT_FIFO_FULL))
+    test.assert_eq(reg_of(c, 0x68), 0x02)
+    test.assert_eq(icm42688.INT_RESET_DONE, 0x10)
+    c.st.insert(4, 0)
+    test.assert(not icm42688.int1_route(d, 8))
+    test.assert(not icm42688.int2_route(d, 8))
+
+@test
+fn test_the_pins_are_set_for_both_in_pulsed_mode() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // Push-pull, active high: polarity and drive of both pins.
+    test.assert(icm42688.int_pins_config(d, false, false))
+    test.assert_eq(reg_of(c, 0x14), 0x1B)
+    test.assert(icm42688.int_pins_config(d, true, false))
+    test.assert_eq(reg_of(c, 0x14), 0x12)
+    test.assert(icm42688.int_pins_config(d, false, true))
+    test.assert_eq(reg_of(c, 0x14), 0x09)
+    test.assert(icm42688.int_pins_config(d, true, true))
+    test.assert_eq(reg_of(c, 0x14), 0x00)
+
+@test
+fn test_the_pulse_timing_follows_the_data_rate() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.int_timing(d, true))
+    test.assert_eq(reg_of(c, 0x64), 0x60)
+    test.assert(icm42688.int_timing(d, false))
+    test.assert_eq(reg_of(c, 0x64), 0x00)
+    test.assert_eq(icm42688.int_status(d), Some(0))
+
+// ── The FIFO ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_fifo_count_is_two_registers_high_byte_first_read_in_one_burst() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(icm42688.fifo_count(d), 0)
+    c.regs.insert(0x16, 0x40)
+    c.regs.insert(0x5F, 0x03)
+    for i in 0..300
+        fifo_both(c, i, 0, 0, 0, 0, 0)
+    log_clear(c)
+    test.assert_eq(icm42688.fifo_count(d), 300)
+    log_is(c, [2, 0x68, 0x2E, 2, -1])
+    c.st.insert(4, 0)
+    test.assert_eq(icm42688.fifo_count(d), 0)
+
+@test
+fn test_the_fifo_is_started_in_bypass_flushed_configured_and_then_streamed() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    log_clear(c)
+    test.assert(icm42688.fifo_start(d, 20, true))
+    test.assert_eq(reg_of(c, 0x16), 0x40)
+    test.assert_eq(reg_of(c, 0x5F), 0x47)
+    test.assert_eq(reg_of(c, 0x60), 20)
+    test.assert_eq(reg_of(c, 0x61), 0)
+    test.assert_eq(reg_of(c, 0x65), 0x14)
+    // The order of the writes: the routes off, bypass, the flush, the
+    // configuration, the watermark, the routes, the mode last.
+    let order = [0x65, 0x16, 0x4B, 0x5F, 0x60, 0x61, 0x65, 0x16]
+    let seen = written(c)
+    test.assert_eq(seen.len(), 8)
+    for k in 0..8
+        test.assert_eq(seen[k], order[k])
+
+@test
+fn test_the_watermark_is_limited_to_what_the_fifo_holds() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.fifo_start(d, 500, true))
+    test.assert_eq(reg_of(c, 0x60), 127)
+    test.assert(icm42688.fifo_start(d, 0, false))
+    test.assert_eq(reg_of(c, 0x60), 1)
+    test.assert_eq(reg_of(c, 0x5F), 0x45)
+    test.assert(icm42688.fifo_start(d, 1000, false))
+    test.assert_eq(reg_of(c, 0x60), 255)
+    test.assert_eq(reg_of(c, 0x61), 0)
+    test.assert(icm42688.fifo_start(d, 5, true))
+
+@test
+fn test_a_fifo_start_that_a_register_refuses_fails() [io, hw]
+    // The writes in order, as (register, which write of it).
+    let regs = [0x65, 0x16, 0x4B, 0x5F, 0x60, 0x61, 0x65, 0x16]
+    let nth = [1, 1, 1, 1, 1, 1, 2, 2]
+    for i in 0..regs.len()
+        let f = flaky_write(chip(), regs[i], nth[i])
+        test.assert(not icm42688.fifo_start(f, 10, true))
+
+@test
+fn test_the_fifo_is_stopped_emptied_and_the_data_ready_route_comes_back() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.fifo_start(d, 20, true))
+    fifo_both(c, 1, 2, 3, 4, 5, 6)
+    test.assert(icm42688.fifo_stop(d))
+    test.assert_eq(reg_of(c, 0x16), 0)
+    test.assert_eq(reg_of(c, 0x5F), 0)
+    test.assert_eq(reg_of(c, 0x65), 0x18)
+    test.assert_eq(icm42688.fifo_count(d), 0)
+    test.assert(icm42688.fifo_stop(d))
+    let regs = [0x16, 0x4B, 0x5F, 0x65]
+    let nth = [1, 1, 1, 1]
+    for i in 0..regs.len()
+        test.assert(not icm42688.fifo_stop(flaky_write(chip(), regs[i], nth[i])))
+
+@test
+fn test_the_fifo_is_read_a_packet_at_a_time_from_the_port() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.fifo_start(d, 20, true))
+    // ±16 g and ±2000 dps after a reset.
+    fifo_both(c, 2048, -2048, 1024, 164, -164, 0)
+    fifo_both(c, 4096, 0, 0, 328, 0, 0)
+    log_clear(c)
+    var a: Vec[AccelMilliG; 32] = Vec.new()
+    test.assert_eq(icm42688.fifo_read(d, var a), 2)
+    log_is(c, [2, 0x68, 0x2E, 2, -1, 2, 0x68, 0x50, 1, -1, 2, 0x68, 0x5F, 1, -1,
+        2, 0x68, 0x30, 16, -1, 2, 0x68, 0x30, 16, -1])
+    test.assert_eq(a.len(), 2)
+    test.assert_eq(a[0].x, 1000)
+    test.assert_eq(a[0].y, -1000)
+    test.assert_eq(a[0].z, 500)
+    test.assert_eq(a[1].x, 2000)
+    test.assert_eq(icm42688.fifo_count(d), 0)
+
+@test
+fn test_both_sensors_samples_come_out_of_one_packet_each() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.fifo_start(d, 20, true))
+    fifo_both(c, 2048, 0, 0, 164, 0, 0)
+    fifo_both(c, 0, 2048, 0, 0, 328, 0)
+    var a: Vec[AccelMilliG; 32] = Vec.new()
+    var g: Vec[GyroMilliDps; 32] = Vec.new()
+    test.assert_eq(icm42688.fifo_read_imu(d, var a, var g), 2)
+    test.assert_eq(a.len(), 2)
+    test.assert_eq(g.len(), 2)
+    test.assert_eq(a[0].x, 1000)
+    test.assert_eq(a[1].y, 1000)
+    test.assert_eq(g[0].x, 10000)
+    test.assert_eq(g[1].y, 20000)
+    test.assert_eq(icm42688.fifo_count(d), 0)
+
+@test
+fn test_a_fifo_of_one_sensor_has_8_byte_packets() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.fifo_start(d, 20, false))
+    fifo_one(c, 0x40, 2048, 0, 0)
+    fifo_one(c, 0x40, 0, 4096, 0)
+    var a: Vec[AccelMilliG; 32] = Vec.new()
+    var g: Vec[GyroMilliDps; 32] = Vec.new()
+    test.assert_eq(icm42688.fifo_read_imu(d, var a, var g), 2)
+    test.assert_eq(a.len(), 2)
+    test.assert_eq(g.len(), 0)
+    test.assert_eq(a[1].y, 2000)
+    // The gyroscope's own packet (header 0x20) goes to its list.
+    test.assert(icm42688.reg_write(d, 0x5F, 0x42))
+    fifo_one(c, 0x20, 164, 0, 0)
+    test.assert_eq(icm42688.fifo_read_imu(d, var a, var g), 1)
+    test.assert_eq(g.len(), 1)
+    test.assert_eq(g[0].x, 10000)
+    // The accelerometer's reader drops it.
+    fifo_one(c, 0x20, 164, 0, 0)
+    test.assert_eq(icm42688.fifo_read(d, var a), 1)
+    test.assert_eq(a.len(), 0)
+
+@test
+fn test_an_invalid_sample_in_a_packet_is_taken_out_and_dropped() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.fifo_start(d, 20, true))
+    // The gyroscope's half is invalid (-32768), then the accelerometer's.
+    fifo_both(c, 2048, 0, 0, -32768, 0, 0)
+    fifo_both(c, -32768, 0, 0, 164, 0, 0)
+    var a: Vec[AccelMilliG; 32] = Vec.new()
+    var g: Vec[GyroMilliDps; 32] = Vec.new()
+    test.assert_eq(icm42688.fifo_read_imu(d, var a, var g), 2)
+    test.assert_eq(a.len(), 1)
+    test.assert_eq(g.len(), 1)
+    fifo_both(c, 2048, 0, 0, -32768, 0, 0)
+    test.assert_eq(icm42688.fifo_read(d, var a), 1)
+    test.assert_eq(a.len(), 1)
+
+@test
+fn test_an_empty_header_ends_the_read() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.fifo_start(d, 20, true))
+    fifo_both(c, 2048, 0, 0, 164, 0, 0)
+    // The count says two; the second packet reads as empty (header 0x80).
+    c.st.insert(98, 32)
+    for i in 16..32
+        c.fifo.insert(i, 0x80)
+    var a: Vec[AccelMilliG; 32] = Vec.new()
+    var g: Vec[GyroMilliDps; 32] = Vec.new()
+    test.assert_eq(icm42688.fifo_read(d, var a), 1)
+    c.st.insert(10, 16)
+    test.assert_eq(icm42688.fifo_read_imu(d, var a, var g), 0)
+    test.assert_eq(a.len(), 0)
+
+@test
+fn test_the_20_bit_packet_is_not_read() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.fifo_start(d, 20, true))
+    fifo_both(c, 2048, 0, 0, 164, 0, 0)
+    c.regs.insert(0x5F, 0x57)
+    var a: Vec[AccelMilliG; 32] = Vec.new()
+    var g: Vec[GyroMilliDps; 32] = Vec.new()
+    test.assert_eq(icm42688.fifo_read(d, var a), 0)
+    test.assert_eq(icm42688.fifo_read_imu(d, var a, var g), 0)
+    // And a FIFO with no sensor batched.
+    c.regs.insert(0x5F, 0x00)
+    test.assert_eq(icm42688.fifo_read(d, var a), 0)
+
+@test
+fn test_a_full_list_stops_the_read_without_taking_a_packet_it_has_no_room_for() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(icm42688.fifo_start(d, 20, true))
+    for i in 0..40
+        fifo_both(c, 2048, 0, 0, 164, 0, 0)
+    var a: Vec[AccelMilliG; 32] = Vec.new()
+    var g: Vec[GyroMilliDps; 32] = Vec.new()
+    test.assert_eq(icm42688.fifo_read_imu(d, var a, var g), 32)
+    test.assert_eq(icm42688.fifo_count(d), 8)
+    test.assert_eq(icm42688.fifo_read(d, var a), 8)
+    // The list of the accelerometer alone.
+    let e = chip()
+    let f = i2c_dut(e)
+    test.assert(icm42688.fifo_start(f, 20, true))
+    for i in 0..40
+        fifo_both(e, 2048, 0, 0, 164, 0, 0)
+    test.assert_eq(icm42688.fifo_read(f, var a), 32)
+    test.assert_eq(icm42688.fifo_count(f), 8)
+
+@test
+fn test_a_fifo_read_stops_when_the_part_goes_quiet() [io, hw]
+    let c = chip()
+    let f = flaky(c)
+    test.assert(icm42688.fifo_start(f, 20, true))
+    for i in 0..3
+        fifo_both(c, 2048, 0, 0, 164, 0, 0)
+    f.quiet.insert(1, 1)
+    f.quiet.insert(0, 1)
+    var a: Vec[AccelMilliG; 32] = Vec.new()
+    var g: Vec[GyroMilliDps; 32] = Vec.new()
+    test.assert_eq(icm42688.fifo_read(f, var a), 1)
+    f.quiet.insert(0, 1)
+    test.assert_eq(icm42688.fifo_read_imu(f, var a, var g), 1)
+    // The reads before the packets fail.
+    let e = chip()
+    let h = i2c_dut(e)
+    test.assert(icm42688.fifo_start(h, 20, true))
+    fifo_both(e, 2048, 0, 0, 164, 0, 0)
+    test.assert_eq(icm42688.fifo_read(flaky_read(e, 0x50, 1), var a), 0)
+    test.assert_eq(icm42688.fifo_read(flaky_read(e, 0x5F, 1), var a), 0)
+    test.assert_eq(icm42688.fifo_read_imu(flaky_read(e, 0x4F, 1), var a, var g), 0)
+    test.assert_eq(icm42688.fifo_read_imu(flaky_read(e, 0x5F, 1), var a, var g), 0)
+    test.assert_eq(icm42688.fifo_read(flaky_read(e, 0x2E, 1), var a), 0)
+    test.assert_eq(icm42688.fifo_read_imu(flaky_read(e, 0x2E, 1), var a, var g), 0)
+
+// ── Self-test ────────────────────────────────────────────────────────
+
+@test
+fn test_the_accelerometer_self_test_is_on_minus_off_and_puts_the_settings_back() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.st.insert(43, 1)
+    c.st.insert(30, 1000)
+    c.st.insert(31, -2000)
+    c.st.insert(32, 3000)
+    put_accel(c, 100, 200, 300)
+    c.regs.insert(0x4E, 0x03)
+    c.regs.insert(0x50, 0x68)
+    c.regs.insert(0x4F, 0x28)
+    log_clear(c)
+    // ±4 g, 8,192 counts a g: the push is 125 mg a 1,000 counts.
+    match icm42688.accel_self_test(d)
+        Some(r) =>
+            test.assert_eq(r.x, 122)
+            test.assert_eq(r.y, -243)
+            test.assert_eq(r.z, 366)
+        None    => test.assert(false)
+    test.assert_eq(reg_of(c, 0x70), 0)
+    test.assert_eq(reg_of(c, 0x50), 0x68)
+    test.assert_eq(reg_of(c, 0x4F), 0x28)
+    test.assert_eq(reg_of(c, 0x4E), 0x03)
+    // The part waited for the modes and for the sensors to start.
+    test.assert(at(c.st, 50) >= 50000)
+
+@test
+fn test_the_gyroscope_self_test_is_on_minus_off() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.st.insert(43, 1)
+    c.st.insert(33, 1310)
+    c.st.insert(34, 0)
+    c.st.insert(35, -131)
+    put_gyro(c, 0, 0, 0)
+    put_accel(c, 0, 0, 0)
+    match icm42688.gyro_self_test(d)
+        Some(r) =>
+            // ±250 dps, 131 counts a degree per second.
+            test.assert_eq(r.x, 10000)
+            test.assert_eq(r.y, 0)
+            test.assert_eq(r.z, -1000)
+        None    => test.assert(false)
+    test.assert_eq(reg_of(c, 0x70), 0)
+    test.assert_eq(reg_of(c, 0x4F), 0x06)
+    test.assert_eq(reg_of(c, 0x4E), 0x00)
+    test.assert(icm42688.gyro_self_test(d) != None)
+    test.assert(icm42688.accel_self_test(d) != None)
+
+@test
+fn test_a_self_test_gives_none_when_a_step_fails_and_still_restores() [io, hw]
+    // The writes in order, as (register, which write of it).
+    let regs = [0x4E, 0x50, 0x4F, 0x70, 0x70]
+    let nth = [1, 1, 1, 1, 2]
+    for i in 0..regs.len()
+        let c = chip()
+        c.st.insert(43, 1)
+        let f = flaky_write(c, regs[i], nth[i])
+        test.assert(icm42688.accel_self_test(f) == None)
+        test.assert_eq(reg_of(c, 0x70), 0)
+        let e = chip()
+        e.st.insert(43, 1)
+        let g = flaky_write(e, regs[i], nth[i])
+        test.assert(icm42688.gyro_self_test(g) == None)
+        test.assert_eq(reg_of(e, 0x70), 0)
+    // The part does not answer at all.
+    let n = chip()
+    n.st.insert(4, 0)
+    test.assert(icm42688.accel_self_test(i2c_dut(n)) == None)
+    test.assert(icm42688.gyro_self_test(i2c_dut(n)) == None)
+
+@test
+fn test_a_self_test_gives_none_when_a_sample_never_comes_or_is_invalid() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // No data-ready flag: the polls give out.
+    test.assert(icm42688.accel_self_test(d) == None)
+    test.assert(icm42688.gyro_self_test(d) == None)
+    // Ready, but the sensor has no sample (-32768 in the registers).
+    let e = chip()
+    e.st.insert(43, 1)
+    put_accel(e, -32768, 0, 0)
+    put_gyro(e, -32768, 0, 0)
+    test.assert(icm42688.accel_self_test(i2c_dut(e)) == None)
+    test.assert(icm42688.gyro_self_test(i2c_dut(e)) == None)
+    // The off mean comes, the on mean does not: the grants run out.
+    let f = chip()
+    f.st.insert(43, 1)
+    f.st.insert(45, 1)
+    f.st.insert(44, 15)
+    put_accel(f, 1, 2, 3)
+    test.assert(icm42688.accel_self_test(i2c_dut(f)) == None)
+    test.assert_eq(reg_of(f, 0x70), 0)
+    let g = chip()
+    g.st.insert(43, 1)
+    g.st.insert(45, 1)
+    g.st.insert(44, 15)
+    put_gyro(g, 1, 2, 3)
+    test.assert(icm42688.gyro_self_test(i2c_dut(g)) == None)
+
+// ── Bring-up ─────────────────────────────────────────────────────────
+
+@test
+fn test_begin_over_i2c_resets_checks_the_id_and_sets_the_part_up() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x76, 2)
+    test.assert(icm42688.start(d))
+    test.assert_eq(bank_of(c), 0)
+    test.assert_eq(reg_of(c, 0x4C), 0x70)
+    test.assert_eq(reg_of(c, 0x13), 0x09)
+    test.assert_eq(bank_reg_of(c, 1, 0x7C), 0x5C)
+    test.assert_eq(reg_of(c, 0x64), 0x00)
+    test.assert_eq(reg_of(c, 0x14), 0x1B)
+    test.assert_eq(reg_of(c, 0x65), 0x08)
+    test.assert_eq(reg_of(c, 0x4F), 0x68)
+    test.assert_eq(reg_of(c, 0x50), 0x68)
+    test.assert_eq(reg_of(c, 0x4E), 0x0F)
+    test.assert_eq(at(c.st, 22), 400000)
+    // 3 ms for the supply, 2 ms for the reset and the polls of RESET_DONE,
+    // 200 us and 50 ms for the sensors.
+    test.assert(at(c.st, 50) >= 3000 + 2000 + 200 + 50000)
+    test.assert_eq(icm42688.accel_rate_read(d), 100000)
+    test.assert_eq(icm42688.gyro_rate_read(d), 100000)
+
+@test
+fn test_begin_over_spi_turns_the_i2c_block_off_and_leaves_the_slew_rates() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(icm42688.start(d))
+    test.assert_eq(reg_of(c, 0x4C), 0x73)
+    test.assert_eq(reg_of(c, 0x13), 0x05)
+    test.assert_eq(bank_reg_of(c, 1, 0x7C), 0x5F)
+    test.assert_eq(reg_of(c, 0x4E), 0x0F)
+    test.assert_eq(at(c.st, 20), 4000000)
+    test.assert_eq(at(c.st, 21), 3)
+
+@test
+fn test_begin_writes_the_reset_first_and_polls_reset_done() [io, hw]
+    let c = chip()
+    c.st.insert(66, 5)
+    let d = i2c_dut(c)
+    log_clear(c)
+    test.assert(icm42688.start(d))
+    // REG_BANK_SEL and its read back, the reset write, then the polls of
+    // INT_STATUS: four showing nothing and the fifth RESET_DONE.
+    test.assert_eq(at(c.log, 0), 1)
+    test.assert_eq(at(c.log, 2), 0x76)
+    test.assert_eq(at(c.log, 3), 0)
+    test.assert_eq(at(c.log, 5), 2)
+    test.assert_eq(at(c.log, 7), 0x76)
+    test.assert_eq(at(c.log, 10), 1)
+    test.assert_eq(at(c.log, 12), 0x11)
+    test.assert_eq(at(c.log, 13), 0x01)
+    test.assert_eq(at(c.log, 15), 2)
+    test.assert_eq(at(c.log, 17), 0x2D)
+    test.assert_eq(at(c.log, 20), 2)
+    test.assert_eq(at(c.log, 22), 0x2D)
+
+@test
+fn test_begin_refuses_a_part_that_is_not_there_or_not_an_icm42688() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    test.assert(not icm42688.start(i2c_dut(c)))
+    let d = chip()
+    d.regs.insert(0x75, 0x42)
+    d.st.insert(100, 0x42)
+    test.assert(not icm42688.start(i2c_dut(d)))
+    let e = chip()
+    test.assert(not icm42688.start(I2cDut { bus: FakeI2c { c: e }, pins: pins(e), w: dev_bus.wiring_spi(0, 67) }))
+    let f = chip()
+    test.assert(not icm42688.start(flaky_read(f, 0x75, 1)))
+
+@test
+fn test_begin_refuses_a_part_that_never_finishes_its_reset() [io, hw]
+    let c = chip()
+    c.st.insert(66, 100000)
+    test.assert(not icm42688.start(i2c_dut(c)))
+
+@test
+fn test_begin_refuses_a_write_the_part_does_not_take() [io, hw]
+    // The writes of `start` over I2C in order, as (register, which write of
+    // it); REG_BANK_SEL is written first, then the bank 1 visit writes it
+    // twice more.
+    let regs = [0x76, 0x11, 0x4C, 0x13, 0x76, 0x7C, 0x76, 0x64, 0x14, 0x65, 0x4F, 0x50, 0x4E]
+    let nth = [1, 1, 1, 1, 2, 1, 3, 1, 1, 1, 1, 1, 1]
+    for i in 0..regs.len()
+        let f = flaky_write(chip(), regs[i], nth[i])
+        test.assert(not icm42688.start(f))
+        test.assert(at(f.seen, regs[i]) >= nth[i])
+
+@test
+fn test_begin_over_spi_refuses_a_write_the_part_does_not_take() [io, hw]
+    let c = chip()
+    test.assert(not icm42688.start(SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: dev_bus.wiring_i2c(0, 0x68) }))
+
+// ── The types over the host's board handles ──────────────────────────
+//
+// The host's handles are absent hardware: every transfer is refused, so
+// each method answers its "no part" value.  This runs the lines of the
+// two types that forward to the functions above.
+
+@test
+fn test_the_i2c_type_over_absent_hardware() [io, hw]
+    let w = dev_bus.wiring_i2c(0, 0x68)
+    let p = Icm42688.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not p.begin())
+    test.assert(p.reg(0x75) == None)
+    test.assert(not p.set_reg(0x4E, 1))
+    test.assert(p.bank_reg(1, 0x7C) == None)
+    test.assert(not p.set_bank_reg(1, 0x7C, 0x13, 0x10))
+    test.assert_eq(p.gyro_set_rate_hz(100), 0)
+    test.assert_eq(p.accel_rate_mhz(), -1)
+    test.assert_eq(p.set_accel_rate_mhz(100000), -1)
+    test.assert_eq(p.gyro_rate_mhz(), -1)
+    test.assert_eq(p.set_gyro_rate_mhz(100000), -1)
+    test.assert(not p.gyro_set_fs_code(5))
+    test.assert(p.accel_mode() == Icm42688Mode.Icm42688Off)
+    test.assert(not p.set_accel_mode(Icm42688Mode.Icm42688LowNoise))
+    test.assert(p.gyro_mode() == Icm42688Mode.Icm42688Off)
+    test.assert(not p.set_gyro_mode(Icm42688Mode.Icm42688LowNoise))
+    test.assert(not p.set_temp_enabled(false))
+    test.assert(not p.accel_aaf(5))
+    test.assert(not p.accel_aaf_off())
+    test.assert(not p.gyro_aaf(5))
+    test.assert(not p.gyro_aaf_off())
+    test.assert(not p.set_ui_filter_order(1, 1))
+    test.assert(not p.set_ui_filter_bw(1, 1))
+    test.assert(not p.route_int1(8))
+    test.assert(not p.route_int2(8))
+    test.assert(not p.configure_pins(true, false))
+    test.assert(not p.set_int_timing(true))
+    test.assert(p.status() == None)
+    test.assert(not p.fifo_begin(10, true))
+    test.assert(not p.fifo_end())
+    var a: Vec[AccelMilliG; 32] = Vec.new()
+    var g: Vec[GyroMilliDps; 32] = Vec.new()
+    test.assert_eq(p.fifo_take_imu(var a, var g), 0)
+    test.assert(p.accel_test() == None)
+    test.assert(p.gyro_test() == None)
+    test.assert_eq(p.irq_level(), -1)
+    test.assert(not p.on_spi())
+    test.assert(p.accel_read() == None)
+    test.assert(not p.accel_ready())
+    test.assert(p.accel_range() == AccelRange2g)
+    test.assert(not p.accel_set_range(AccelRange4g))
+    test.assert_eq(p.accel_rate_hz(), 0)
+    test.assert_eq(p.accel_set_rate_hz(100), 0)
+    test.assert_eq(p.accel_fifo_count(), 0)
+    test.assert_eq(p.accel_fifo_read(var a), 0)
+    test.assert(p.gyro_read() == None)
+    test.assert(not p.gyro_ready())
+    test.assert(p.gyro_range() == GyroRange250dps)
+    test.assert(not p.gyro_set_range(GyroRange500dps))
+    test.assert_eq(p.gyro_rate_hz(), 0)
+    test.assert(p.imu_read() == None)
+    test.assert_eq(p.temp_start(), 0)
+    test.assert(p.temp_read() == None)
+    test.assert(p.device_id() == None)
+    test.assert(not p.device_probe(0x47))
+
+@test
+fn test_the_spi_type_over_absent_hardware() [io, hw]
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let p = Icm42688Spi.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, w)
+    p.wait_us(10)
+    test.assert(not p.begin())
+    test.assert(p.reg(0x75) == None)
+    test.assert(not p.set_reg(0x4E, 1))
+    test.assert(p.bank_reg(1, 0x7C) == None)
+    test.assert(not p.set_bank_reg(1, 0x7C, 0x13, 0x10))
+    test.assert_eq(p.gyro_set_rate_hz(100), 0)
+    test.assert_eq(p.accel_rate_mhz(), -1)
+    test.assert_eq(p.set_accel_rate_mhz(100000), -1)
+    test.assert_eq(p.gyro_rate_mhz(), -1)
+    test.assert_eq(p.set_gyro_rate_mhz(100000), -1)
+    test.assert(not p.gyro_set_fs_code(5))
+    test.assert(p.accel_mode() == Icm42688Mode.Icm42688Off)
+    test.assert(not p.set_accel_mode(Icm42688Mode.Icm42688LowNoise))
+    test.assert(p.gyro_mode() == Icm42688Mode.Icm42688Off)
+    test.assert(not p.set_gyro_mode(Icm42688Mode.Icm42688LowNoise))
+    test.assert(not p.set_temp_enabled(false))
+    test.assert(not p.accel_aaf(5))
+    test.assert(not p.accel_aaf_off())
+    test.assert(not p.gyro_aaf(5))
+    test.assert(not p.gyro_aaf_off())
+    test.assert(not p.set_ui_filter_order(1, 1))
+    test.assert(not p.set_ui_filter_bw(1, 1))
+    test.assert(not p.route_int1(8))
+    test.assert(not p.route_int2(8))
+    test.assert(not p.configure_pins(true, false))
+    test.assert(not p.set_int_timing(true))
+    test.assert(p.status() == None)
+    test.assert(not p.fifo_begin(10, true))
+    test.assert(not p.fifo_end())
+    var a: Vec[AccelMilliG; 32] = Vec.new()
+    var g: Vec[GyroMilliDps; 32] = Vec.new()
+    test.assert_eq(p.fifo_take_imu(var a, var g), 0)
+    test.assert(p.accel_test() == None)
+    test.assert(p.gyro_test() == None)
+    test.assert_eq(p.irq_level(), -1)
+    test.assert(p.on_spi())
+    test.assert(p.accel_read() == None)
+    test.assert(not p.accel_ready())
+    test.assert(p.accel_range() == AccelRange2g)
+    test.assert(not p.accel_set_range(AccelRange4g))
+    test.assert_eq(p.accel_rate_hz(), 0)
+    test.assert_eq(p.accel_set_rate_hz(100), 0)
+    test.assert_eq(p.accel_fifo_count(), 0)
+    test.assert_eq(p.accel_fifo_read(var a), 0)
+    test.assert(p.gyro_read() == None)
+    test.assert(not p.gyro_ready())
+    test.assert(p.gyro_range() == GyroRange250dps)
+    test.assert(not p.gyro_set_range(GyroRange500dps))
+    test.assert_eq(p.gyro_rate_hz(), 0)
+    test.assert(p.imu_read() == None)
+    test.assert_eq(p.temp_start(), 0)
+    test.assert(p.temp_read() == None)
+    test.assert(p.device_id() == None)
+    test.assert(not p.device_probe(0x47))

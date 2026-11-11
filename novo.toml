@@ -1,0 +1,29 @@
+[package]
+name        = "icm42688-nv"
+version     = "0.1.0"
+description = "A driver for TDK InvenSense's ICM-42688-P six-axis IMU on an I2C or an SPI bus: the acceleration in milli-g and the rate of turn in milli-degrees per second at the range and rate set, the power modes, the register banks, the anti-alias and UI filters, the data-ready and watermark interrupts, the FIFO in stream mode with its 16-bit packets, the temperature and the self-tests, as devices-nv's Accelerometer, Gyroscope, Imu, Thermometer and Identifiable."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["icm42688", "icm-42688-p", "imu", "accelerometer", "gyroscope", "i2c", "spi", "sensor", "tdk", "invensense", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/icm42688-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+# The package is checked at the embedded tier, the strictest one, so every
+# function in it is also valid at rt and system.
+[tier]
+tier = "embedded"
+
+[docs.pages]
+"README.md" = "Reading an ICM-42688-P six-axis IMU from a device program"
+
+[dependencies]
+# The board's I2C bus, SPI bus, GPIO and timer handles, and the I2cBus,
+# SpiBus and GpioOut traits they implement.
+embedded-hal-nv = "^0.3.3"
+# The wiring record a board's device table hands `attach`, the register
+# helpers, and the Accelerometer, Gyroscope, Imu, Thermometer and
+# Identifiable traits.
+devices-nv      = "^0.3.3"
