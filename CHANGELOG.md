@@ -1,9 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-11-12
 
-Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
-are path dependencies until they are published.
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0. The release depends on both.
 
 - `ImuControl` is implemented for `Icm42688` and `Icm42688Spi`: `imu_ready`
   reads the shared data-ready flag, `imu_set_rate_hz` and `imu_rate_hz` set and

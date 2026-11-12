@@ -1,6 +1,6 @@
 [package]
 name        = "icm42688-nv"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "A driver for TDK InvenSense's ICM-42688-P six-axis IMU on an I2C or an SPI bus: the acceleration in milli-g and the rate of turn in milli-degrees per second at the range and rate set, the power modes, the register banks, the anti-alias and UI filters, the data-ready and watermark interrupts, the FIFO in stream mode with its 16-bit packets, the temperature and the self-tests, as devices-nv's Accelerometer, Gyroscope, Imu, Thermometer and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
