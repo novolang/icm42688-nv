@@ -84,11 +84,11 @@
 // `i2c_write`, `spi_read_into` and `spi_write`, so a test runs them over a
 // double of the bus.
 
-use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, BoardTimer, I2cBus, SpiBus, GpioOut }
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_accel.{ AccelMilliG, AccelRange, AccelFifoMode, AccelMode, Accelerometer }
 use dev_gyro.{ GyroMilliDps, GyroRange, Gyroscope }
-use dev_imu.{ ImuSample, Imu }
+use dev_imu.{ ImuSample, Imu, ImuControl }
 use dev_thermo.{ TempMilliC, Thermometer }
 use dev_id.{ DeviceId, Identifiable }
 
@@ -143,6 +143,7 @@ let SPR_FIFO_FLUSH = 0x02
 // FIFO_CONFIG: bypass and stream-to-FIFO.
 let FIFO_BYPASS = 0x00
 let FIFO_STREAM = 0x40
+let FIFO_STOP   = 0x80
 // FIFO_CONFIG1: the sensors, the temperature, and the partial read.
 let FC1_ACCEL   = 0x01
 let FC1_GYRO    = 0x02
@@ -388,23 +389,32 @@ pub fn accel_fs_of(r: AccelRange) -> Int
         AccelRange2g  => 3
 
 // The gyroscope range a GYRO_CONFIG0 byte selects (§ 14.37): 000 ±2000,
-// 001 ±1000, 010 ±500, 011 ±250 dps.  The codes 100 to 111 are ±125, ±62.5,
-// ±31.25 and ±15.625 dps, which `GyroRange` has no value for; the narrowest
-// value that holds them, ±250 dps, is answered.
+// 001 ±1000, 010 ±500, 011 ±250, 100 ±125, 101 ±62.5, 110 ±31.25 and
+// 111 ±15.625 dps.
 pub fn gyro_range_of(cfg0: Int) -> GyroRange
     match (cfg0 >> 5) & 7
         0 => GyroRange2000dps
         1 => GyroRange1000dps
         2 => GyroRange500dps
-        _ => GyroRange250dps
+        3 => GyroRange250dps
+        4 => GyroRange125dps
+        5 => GyroRange62dps
+        6 => GyroRange31dps
+        _ => GyroRange15dps
 
-// The GYRO_FS_SEL code for a range.
+// The GYRO_FS_SEL code for a range, -1 for the range of ±4000 dps, which
+// the part does not have.
 pub fn gyro_fs_of(r: GyroRange) -> Int
     match r
         GyroRange2000dps => 0
         GyroRange1000dps => 1
         GyroRange500dps  => 2
         GyroRange250dps  => 3
+        GyroRange125dps  => 4
+        GyroRange62dps   => 5
+        GyroRange31dps   => 6
+        GyroRange15dps   => 7
+        GyroRange4000dps => -1
 
 // The accelerometer's counts per g (Table 2).
 pub fn lsb_per_g(cfg0: Int) -> Int
@@ -611,15 +621,11 @@ pub fn gyro_range_read<P: Icm42688Port>(p: P) -> GyroRange [hw]
     gyro_range_of(reg_read(p, GYRO_CONFIG0) ?? 0x60)
 
 // Sets the gyroscope range and leaves the rate: whether the part took it.
+// The range of ±4000 dps is refused, since the part tops out at ±2000.  The
+// readings are converted at the sensitivity of the range set.
 pub fn gyro_range_write<P: Icm42688Port>(p: P, r: GyroRange) -> Bool [hw]
-    reg_update(p, GYRO_CONFIG0, 0xE0, gyro_fs_of(r) << 5)
-
-// Sets the gyroscope's GYRO_FS_SEL code, 0 to 7, which reaches the four
-// ranges below ±250 dps (±125, ±62.5, ±31.25 and ±15.625 dps) that
-// `GyroRange` has no value for: whether the part took it.  The readings are
-// converted at the sensitivity of the code.
-pub fn gyro_fs_code_write<P: Icm42688Port>(p: P, code: Int) -> Bool [hw]
-    if code < 0 or code > 7
+    let code = gyro_fs_of(r)
+    if code < 0
         return false
     reg_update(p, GYRO_CONFIG0, 0xE0, code << 5)
 
@@ -709,6 +715,32 @@ pub fn gyro_rate_hz_read<P: Icm42688Port>(p: P) -> Int [hw]
 pub fn gyro_rate_hz_write<P: Icm42688Port>(p: P, hz: Int) -> Int [hw]
     hz_of_mhz(gyro_rate_write(p, hz * 1000))
 
+// The rate both sensors run at, in whole hertz, for `ImuControl`: the
+// accelerometer's when it is on, else the gyroscope's, 0 when both are off
+// or the part did not answer.
+pub fn imu_rate_read<P: Icm42688Port>(p: P) -> Int [hw]
+    let a = accel_rate_read(p)
+    if a > 0
+        return hz_of_mhz(a)
+    hz_of_mhz(gyro_rate_read(p))
+
+// Sets both sensors to the slowest rate at or above `hz` that each can run
+// and answers the accelerometer's rate taken, in whole hertz, which is never
+// above the gyroscope's: 0 when the part did not take it.  The sensors share
+// the rate in low-noise mode; an accelerometer in low-power mode runs the
+// rates of 500 Hz and below, so its rate can be the lower.  A request below
+// 1 Hz is taken as 1 Hz, since the sensors are turned off with
+// `imu_standby_write`.
+pub fn imu_rate_write<P: Icm42688Port>(p: P, hz: Int) -> Int [hw]
+    var want = hz
+    if want < 1
+        want = 1
+    let a = accel_rate_write(p, want * 1000)
+    let g = gyro_rate_write(p, want * 1000)
+    if a < 0 or g < 0
+        return 0
+    hz_of_mhz(a)
+
 // The ACCEL_MODE code for a mode, -1 for a mode the accelerometer does not
 // have.
 fn accel_mode_code(m: Icm42688Mode) -> Int
@@ -757,6 +789,24 @@ pub fn accel_mode_write<P: Icm42688Port>(p: P, m: Icm42688Mode) -> Bool [hw]
     p.wait_us(WAIT_MODE_US)
     true
 
+// The accelerometer's mode as `Accelerometer.accel_mode` states it: low
+// power is `AccelLowPower` and low noise is `AccelNormal`, the part's only
+// two running modes.  `None` when the accelerometer is off or the part did
+// not answer.
+pub fn accel_mode_of<P: Icm42688Port>(p: P) -> ?AccelMode [hw]
+    match accel_mode_read(p)
+        Icm42688LowPower => Some(AccelLowPower)
+        Icm42688LowNoise => Some(AccelNormal)
+        _                => None
+
+// Puts the accelerometer in the mode nearest `m`: low power for
+// `AccelLowPower`, low noise for the other two, since low noise is the
+// part's lowest-noise mode.  Whether the part took it.
+pub fn accel_mode_set<P: Icm42688Port>(p: P, m: AccelMode) -> Bool [hw]
+    match m
+        AccelLowPower => accel_mode_write(p, Icm42688LowPower)
+        _             => accel_mode_write(p, Icm42688LowNoise)
+
 // The gyroscope's power mode, off when the part does not answer.
 pub fn gyro_mode_read<P: Icm42688Port>(p: P) -> Icm42688Mode [hw]
     match ((reg_read(p, PWR_MGMT0) ?? 0) >> 2) & 3
@@ -775,6 +825,27 @@ pub fn gyro_mode_write<P: Icm42688Port>(p: P, m: Icm42688Mode) -> Bool [hw]
         return false
     p.wait_us(WAIT_MODE_US)
     true
+
+// Puts the accelerometer and the gyroscope in standby, or takes them out of
+// it, for `ImuControl`: whether the part took both.  The gyroscope has a
+// standby mode; the accelerometer has none, and off is its nearest, so
+// `accel` turns it off.  Taking a sensor out of standby turns it on in
+// low-noise mode, and leaves a sensor that is already running as it is, so
+// a sensor in low-power mode keeps that mode.
+pub fn imu_standby_write<P: Icm42688Port>(p: P, accel: Bool, gyro: Bool) -> Bool [hw]
+    let Some(pm) = reg_read(p, PWR_MGMT0) else return false
+    let accel_on = (pm & 3) >= 2
+    let gyro_on = ((pm >> 2) & 3) == 3
+    var ok = true
+    if accel and accel_on
+        ok = accel_mode_write(p, Icm42688Off)
+    if not accel and not accel_on
+        ok = accel_mode_write(p, Icm42688LowNoise)
+    if gyro and gyro_on
+        ok = ok and gyro_mode_write(p, Icm42688Standby)
+    if not gyro and not gyro_on
+        ok = ok and gyro_mode_write(p, Icm42688LowNoise)
+    ok
 
 // Turns the temperature sensor on or off (TEMP_DIS): whether the part took
 // it.
@@ -1002,6 +1073,11 @@ pub fn fifo_count<P: Icm42688Port>(p: P) -> Int [hw]
 // it a read that does not take the whole FIFO has to read it all again
 // (§ 14.45), and this driver reads a packet at a time.
 pub fn fifo_start<P: Icm42688Port>(p: P, threshold: Int, with_gyro: Bool) -> Bool [hw]
+    fifo_run(p, threshold, with_gyro, FIFO_STREAM)
+
+// `fifo_start` with the FIFO_MODE bits given: `FIFO_STREAM` overwrites the
+// oldest packet when the FIFO is full, `FIFO_STOP` stops collecting.
+fn fifo_run<P: Icm42688Port>(p: P, threshold: Int, with_gyro: Bool, mode: Int) -> Bool [hw]
     var cfg1 = FC1_ACCEL | FC1_TEMP | FC1_PARTIAL
     var cap = 255
     if with_gyro
@@ -1026,7 +1102,7 @@ pub fn fifo_start<P: Icm42688Port>(p: P, threshold: Int, with_gyro: Bool) -> Boo
         return false
     if not reg_update(p, INT_SOURCE0, IS0_DRDY | IS0_FIFO_THS, IS0_FIFO_THS)
         return false
-    reg_write(p, FIFO_CONFIG, FIFO_STREAM)
+    reg_write(p, FIFO_CONFIG, mode)
 
 // Turns the FIFO off, which empties it, stops the batching and puts the
 // data-ready flag back on INT1: whether the part took every setting.
@@ -1038,6 +1114,38 @@ pub fn fifo_stop<P: Icm42688Port>(p: P) -> Bool [hw]
     if not reg_write(p, FIFO_CONFIG1, 0)
         return false
     reg_update(p, INT_SOURCE0, IS0_DRDY | IS0_FIFO_THS, IS0_DRDY)
+
+// What the FIFO does and the watermark in packets, 1 to 32, for
+// `Accelerometer.accel_fifo_config`: whether the part took every setting.
+// `AccelFifoOff` bypasses the FIFO and empties it (`fifo_stop`), the
+// watermark ignored.  `AccelFifoStream` is stream mode and `AccelFifoStop`
+// the part's stop-on-full mode, both with the accelerometer batched and the
+// gyroscope too when it is running, since a packet that carries both is the
+// part's own form for an IMU.  A watermark outside 1 to 32 is refused.
+pub fn fifo_configure<P: Icm42688Port>(p: P, mode: AccelFifoMode, watermark: Int) -> Bool [hw]
+    if mode == AccelFifoOff
+        return fifo_stop(p)
+    if watermark < 1 or watermark > LIST_DEPTH
+        return false
+    let Some(pm) = reg_read(p, PWR_MGMT0) else return false
+    var reg = FIFO_STREAM
+    if mode == AccelFifoStop
+        reg = FIFO_STOP
+    fifo_run(p, watermark, ((pm >> 2) & 3) == 3, reg)
+
+// Whether the FIFO holds at least the watermark that FIFO_CONFIG2 and
+// FIFO_CONFIG3 hold: the count against the watermark, in packets.  The
+// part's own FIFO_THS_INT flag is in INT_STATUS, which clears on read and
+// would take the data-ready flag with it, so it is not read.  False for a
+// FIFO with no watermark set and when the part did not answer.
+pub fn fifo_watermark_reached<P: Icm42688Port>(p: P) -> Bool [hw]
+    var w: DevBytes = Vec.new()
+    if not p.read_regs(FIFO_CONFIG2, 2, var w)
+        return false
+    let wm = w[0] as Int | ((w[1] as Int & 0x0F) << 8)
+    if wm == 0
+        return false
+    fifo_count(p) >= wm
 
 // Takes one packet of `len` bytes out of the FIFO into `b`: whether the
 // part answered.
@@ -1306,12 +1414,11 @@ pub fn start<P: Icm42688Port>(p: P) -> Bool [hw]
 // ── The part on an I2C bus ───────────────────────────────────────────
 
 // An ICM-42688-P on a board's I2C bus at the address `w.addr`, 0x68 or
-// 0x69, with the board's GPIO for the INT1 line and its timer.
+// 0x69, with the board's GPIO for the INT1 line.
 pub @value
 struct Icm42688
     bus: BoardI2c
     pins: BoardGpio
-    timer: BoardTimer
     w: DeviceWiring
 
 impl Icm42688Port for Icm42688
@@ -1331,13 +1438,13 @@ impl Icm42688Port for Icm42688
         false
 
     fn wait_us(self, us: Int) [hw]
-        self.timer.delay_us(us)
+        self.bus.delay_us(us)
 
 impl Icm42688
     // The part at `w.addr` on the board's I2C bus, as a board's device
     // table builds it.  Nothing is sent.
     fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Icm42688
-        Icm42688 { bus: bus, pins: pins, timer: BoardTimer { id: 0 }, w: w }
+        Icm42688 { bus: bus, pins: pins, w: w }
 
     // Brings the part up (`start`).
     fn begin(self) -> Bool [hw]
@@ -1358,16 +1465,11 @@ impl Icm42688
     fn set_bank_reg(self, bank: Int, r: Int, mask: Int, v: Int) -> Bool [hw]
         bank_update(self, bank, r, mask, v)
 
-    // The gyroscope's setter for the rate, and the rates in thousandths of
-    // a hertz.
+    // The gyroscope's setter for the rate, and its rates in thousandths of
+    // a hertz; the accelerometer's are `Accelerometer.accel_rate_mhz` and
+    // `accel_set_rate_mhz`.
     fn gyro_set_rate_hz(self, hz: Int) -> Int [hw]
         gyro_rate_hz_write(self, hz)
-
-    fn accel_rate_mhz(self) -> Int [hw]
-        accel_rate_read(self)
-
-    fn set_accel_rate_mhz(self, mhz: Int) -> Int [hw]
-        accel_rate_write(self, mhz)
 
     fn gyro_rate_mhz(self) -> Int [hw]
         gyro_rate_read(self)
@@ -1375,17 +1477,10 @@ impl Icm42688
     fn set_gyro_rate_mhz(self, mhz: Int) -> Int [hw]
         gyro_rate_write(self, mhz)
 
-    // The gyroscope at a range below ±250 dps (code 4 to 7).
-    fn gyro_set_fs_code(self, code: Int) -> Bool [hw]
-        gyro_fs_code_write(self, code)
-
-    // The power modes of the two sensors and the temperature sensor.
-    fn accel_mode(self) -> Icm42688Mode [hw]
-        accel_mode_read(self)
-
-    fn set_accel_mode(self, m: Icm42688Mode) -> Bool [hw]
-        accel_mode_write(self, m)
-
+    // The gyroscope's power mode and the temperature sensor; the
+    // accelerometer's modes are `Accelerometer.accel_mode` and
+    // `accel_set_mode`, and `ImuControl.imu_standby` turns either sensor
+    // off.
     fn gyro_mode(self) -> Icm42688Mode [hw]
         gyro_mode_read(self)
 
@@ -1430,10 +1525,8 @@ impl Icm42688
     fn status(self) -> ?Int [hw]
         int_status(self)
 
-    // The FIFO: on, off, and both sensors' samples.
-    fn fifo_begin(self, threshold: Int, with_gyro: Bool) -> Bool [hw]
-        fifo_start(self, threshold, with_gyro)
-
+    // The FIFO: off, and both sensors' samples.  It is turned on with
+    // `Accelerometer.accel_fifo_config`.
     fn fifo_end(self) -> Bool [hw]
         fifo_stop(self)
 
@@ -1477,6 +1570,27 @@ impl Accelerometer[hw] for Icm42688
     fn accel_fifo_read(self, var dst: Vec[AccelMilliG; 32]) -> Int [hw]
         fifo_read(self, var dst)
 
+    // The rates in thousandths of a hertz, with the part's 1.5625, 3.125,
+    // 6.25 and 12.5 Hz; 0 when the sensor is off, -1 when the part did not
+    // answer.
+    fn accel_rate_mhz(self) -> Int [hw]
+        accel_rate_read(self)
+
+    fn accel_set_rate_mhz(self, mhz: Int) -> Int [hw]
+        accel_rate_write(self, mhz)
+
+    fn accel_mode(self) -> ?AccelMode [hw]
+        accel_mode_of(self)
+
+    fn accel_set_mode(self, m: AccelMode) -> Bool [hw]
+        accel_mode_set(self, m)
+
+    fn accel_fifo_config(self, mode: AccelFifoMode, watermark: Int) -> Bool [hw]
+        fifo_configure(self, mode, watermark)
+
+    fn accel_fifo_watermark_reached(self) -> Bool [hw]
+        fifo_watermark_reached(self)
+
 impl Gyroscope[hw] for Icm42688
     fn gyro_read(self) -> ?GyroMilliDps [hw]
         gyro_read_of(self)
@@ -1498,6 +1612,21 @@ impl Imu[hw] for Icm42688
     fn imu_read(self) -> ?ImuSample [hw]
         imu_read_of(self)
 
+impl ImuControl[hw] for Icm42688
+    // The one data-ready flag both sensors share, which clears when it is
+    // read.
+    fn imu_ready(self) -> Bool [hw]
+        data_ready_of(self)
+
+    fn imu_set_rate_hz(self, hz: Int) -> Int [hw]
+        imu_rate_write(self, hz)
+
+    fn imu_rate_hz(self) -> Int [hw]
+        imu_rate_read(self)
+
+    fn imu_standby(self, accel: Bool, gyro: Bool) -> Bool [hw]
+        imu_standby_write(self, accel, gyro)
+
 impl Thermometer[hw] for Icm42688
     // The sensor converts by itself while a motion sensor is on, so
     // nothing is started and no time is needed.
@@ -1516,12 +1645,11 @@ impl Identifiable[hw] for Icm42688
 // ── The part on an SPI bus ───────────────────────────────────────────
 
 // An ICM-42688-P on a board's SPI bus with the chip select `w.cs`, with the
-// board's GPIO for the chip select and the INT1 line, and its timer.
+// board's GPIO for the chip select and the INT1 line.
 pub @value
 struct Icm42688Spi
     bus: BoardSpi
     pins: BoardGpio
-    timer: BoardTimer
     w: DeviceWiring
 
 impl Icm42688Port for Icm42688Spi
@@ -1541,13 +1669,13 @@ impl Icm42688Port for Icm42688Spi
         true
 
     fn wait_us(self, us: Int) [hw]
-        self.timer.delay_us(us)
+        self.bus.delay_us(us)
 
 impl Icm42688Spi
     // The part on the board's SPI bus with the chip select `w.cs`, as a
     // board's device table builds it.  Nothing is sent.
     fn attach(bus: BoardSpi, pins: BoardGpio, w: DeviceWiring) -> Icm42688Spi
-        Icm42688Spi { bus: bus, pins: pins, timer: BoardTimer { id: 0 }, w: w }
+        Icm42688Spi { bus: bus, pins: pins, w: w }
 
     // Brings the part up (`start`).
     fn begin(self) -> Bool [hw]
@@ -1568,16 +1696,11 @@ impl Icm42688Spi
     fn set_bank_reg(self, bank: Int, r: Int, mask: Int, v: Int) -> Bool [hw]
         bank_update(self, bank, r, mask, v)
 
-    // The gyroscope's setter for the rate, and the rates in thousandths of
-    // a hertz.
+    // The gyroscope's setter for the rate, and its rates in thousandths of
+    // a hertz; the accelerometer's are `Accelerometer.accel_rate_mhz` and
+    // `accel_set_rate_mhz`.
     fn gyro_set_rate_hz(self, hz: Int) -> Int [hw]
         gyro_rate_hz_write(self, hz)
-
-    fn accel_rate_mhz(self) -> Int [hw]
-        accel_rate_read(self)
-
-    fn set_accel_rate_mhz(self, mhz: Int) -> Int [hw]
-        accel_rate_write(self, mhz)
 
     fn gyro_rate_mhz(self) -> Int [hw]
         gyro_rate_read(self)
@@ -1585,17 +1708,10 @@ impl Icm42688Spi
     fn set_gyro_rate_mhz(self, mhz: Int) -> Int [hw]
         gyro_rate_write(self, mhz)
 
-    // The gyroscope at a range below ±250 dps (code 4 to 7).
-    fn gyro_set_fs_code(self, code: Int) -> Bool [hw]
-        gyro_fs_code_write(self, code)
-
-    // The power modes of the two sensors and the temperature sensor.
-    fn accel_mode(self) -> Icm42688Mode [hw]
-        accel_mode_read(self)
-
-    fn set_accel_mode(self, m: Icm42688Mode) -> Bool [hw]
-        accel_mode_write(self, m)
-
+    // The gyroscope's power mode and the temperature sensor; the
+    // accelerometer's modes are `Accelerometer.accel_mode` and
+    // `accel_set_mode`, and `ImuControl.imu_standby` turns either sensor
+    // off.
     fn gyro_mode(self) -> Icm42688Mode [hw]
         gyro_mode_read(self)
 
@@ -1640,10 +1756,8 @@ impl Icm42688Spi
     fn status(self) -> ?Int [hw]
         int_status(self)
 
-    // The FIFO: on, off, and both sensors' samples.
-    fn fifo_begin(self, threshold: Int, with_gyro: Bool) -> Bool [hw]
-        fifo_start(self, threshold, with_gyro)
-
+    // The FIFO: off, and both sensors' samples.  It is turned on with
+    // `Accelerometer.accel_fifo_config`.
     fn fifo_end(self) -> Bool [hw]
         fifo_stop(self)
 
@@ -1687,6 +1801,27 @@ impl Accelerometer[hw] for Icm42688Spi
     fn accel_fifo_read(self, var dst: Vec[AccelMilliG; 32]) -> Int [hw]
         fifo_read(self, var dst)
 
+    // The rates in thousandths of a hertz, with the part's 1.5625, 3.125,
+    // 6.25 and 12.5 Hz; 0 when the sensor is off, -1 when the part did not
+    // answer.
+    fn accel_rate_mhz(self) -> Int [hw]
+        accel_rate_read(self)
+
+    fn accel_set_rate_mhz(self, mhz: Int) -> Int [hw]
+        accel_rate_write(self, mhz)
+
+    fn accel_mode(self) -> ?AccelMode [hw]
+        accel_mode_of(self)
+
+    fn accel_set_mode(self, m: AccelMode) -> Bool [hw]
+        accel_mode_set(self, m)
+
+    fn accel_fifo_config(self, mode: AccelFifoMode, watermark: Int) -> Bool [hw]
+        fifo_configure(self, mode, watermark)
+
+    fn accel_fifo_watermark_reached(self) -> Bool [hw]
+        fifo_watermark_reached(self)
+
 impl Gyroscope[hw] for Icm42688Spi
     fn gyro_read(self) -> ?GyroMilliDps [hw]
         gyro_read_of(self)
@@ -1707,6 +1842,21 @@ impl Gyroscope[hw] for Icm42688Spi
 impl Imu[hw] for Icm42688Spi
     fn imu_read(self) -> ?ImuSample [hw]
         imu_read_of(self)
+
+impl ImuControl[hw] for Icm42688Spi
+    // The one data-ready flag both sensors share, which clears when it is
+    // read.
+    fn imu_ready(self) -> Bool [hw]
+        data_ready_of(self)
+
+    fn imu_set_rate_hz(self, hz: Int) -> Int [hw]
+        imu_rate_write(self, hz)
+
+    fn imu_rate_hz(self) -> Int [hw]
+        imu_rate_read(self)
+
+    fn imu_standby(self, accel: Bool, gyro: Bool) -> Bool [hw]
+        imu_standby_write(self, accel, gyro)
 
 impl Thermometer[hw] for Icm42688Spi
     // The sensor converts by itself while a motion sensor is on, so

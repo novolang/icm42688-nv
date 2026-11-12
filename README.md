@@ -89,7 +89,7 @@ nothing else. The driver performs no input or output of its own and
 allocates nothing of its own: every buffer is a fixed-size `Vec` in the
 caller's frame. The bus functions of devices-nv build one short frame per
 transaction inside a `system` block and release it when the call returns.
-The waits go through the board's timer, which is `[hw]` too. The package
+The waits go through the bus's `delay_us`, which is `[hw]` too. The package
 checks at every tier, `embedded` included.
 
 ## What it is
@@ -111,9 +111,11 @@ sensitivities are the data sheet's (Tables 1 and 2):
 | Counts per dps | 16.4 | 32.8 | 65.5 | 131 | 262 | 524.3 | 1048.6 | 2097.2 |
 
 The full-scale code runs from the widest range to the narrowest.
-`GyroRange` has no value below ±250 dps, so `gyro_set_fs_code` sets the
-four narrow ranges, `gyro_range` then answers `GyroRange250dps`, and the
-readings are converted at the code's sensitivity.
+`GyroRange` has the four narrow ranges as `GyroRange125dps`,
+`GyroRange62dps`, `GyroRange31dps` and `GyroRange15dps` (the names give the
+whole degrees per second), and `gyro_set_range` takes them. `GyroRange4000dps`
+is refused, since the part tops out at ±2000 dps. The readings are converted
+at the sensitivity of the range set.
 
 The registers are in five banks. REG_BANK_SEL (0x76) is in every bank and
 selects the bank. Bank 0 holds the data, the configuration and the FIFO;
@@ -169,23 +171,26 @@ novo pkg add icm42688-nv
 A program on a board uses `Icm42688` for a part on I2C and `Icm42688Spi`
 for a part on SPI. Each is built by `attach` with the board's bus, its
 GPIO and the wiring, as a board's device table builds it. Both implement
-`Accelerometer`, `Gyroscope`, `Imu`, `Thermometer` and `Identifiable`.
+`Accelerometer`, `Gyroscope`, `Imu`, `ImuControl`, `Thermometer` and
+`Identifiable`.
 
 | Method | What it does |
 |---|---|
 | `attach(bus, pins, w)` | the part at `w.addr` (I2C) or with the chip select `w.cs` (SPI); nothing is sent |
 | `begin()` | brings the part up, see below |
 | `accel_read()`, `gyro_read()`, `imu_read()` | `Accelerometer`, `Gyroscope`, `Imu`: milli-g, milli-degrees per second, and both from one burst of twelve registers |
-| `accel_ready()`, `gyro_ready()` | DATA_RDY_INT of INT_STATUS, one flag for both sensors, cleared by the read |
-| `accel_range()`, `accel_set_range(r)`, `gyro_range()`, `gyro_set_range(r)` | the full scales, changed without touching the rate; `gyro_set_fs_code(code)` for the ranges below ±250 dps |
+| `accel_ready()`, `gyro_ready()`, `imu_ready()` | DATA_RDY_INT of INT_STATUS, one flag for both sensors, cleared by the read |
+| `accel_range()`, `accel_set_range(r)`, `gyro_range()`, `gyro_set_range(r)` | the full scales, changed without touching the rate; the gyroscope's eight ranges from ±15.625 to ±2000 dps |
 | `accel_rate_hz()`, `accel_set_rate_hz(hz)`, `gyro_rate_hz()`, `gyro_set_rate_hz(hz)` | the rates in whole hertz, and the slowest rate at or above `hz` that the sensor's mode runs; 0 turns the sensor off |
-| `accel_rate_mhz()`, `set_accel_rate_mhz(mhz)`, `gyro_rate_mhz()`, `set_gyro_rate_mhz(mhz)` | the same in thousandths of a hertz |
-| `accel_mode()`, `set_accel_mode(m)`, `gyro_mode()`, `set_gyro_mode(m)`, `set_temp_enabled(on)` | the power modes and TEMP_DIS |
+| `accel_rate_mhz()`, `accel_set_rate_mhz(mhz)`, `gyro_rate_mhz()`, `set_gyro_rate_mhz(mhz)` | the same in thousandths of a hertz |
+| `accel_mode()`, `accel_set_mode(m)` | `AccelLowPower` and `AccelNormal` (low noise); `AccelHighResolution` sets low noise too, and `accel_mode()` answers `None` while the accelerometer is off |
+| `gyro_mode()`, `set_gyro_mode(m)`, `set_temp_enabled(on)` | the gyroscope's power modes and TEMP_DIS |
+| `imu_set_rate_hz(hz)`, `imu_rate_hz()`, `imu_standby(accel, gyro)` | `ImuControl`: one rate for both sensors (a request of 0 is the slowest rate, not off), and standby for either; the accelerometer has no standby mode, so `true` turns it off |
 | `accel_aaf(delt)`, `accel_aaf_off()`, `gyro_aaf(delt)`, `gyro_aaf_off()` | the anti-alias filters, DELT 1 to 63, 42 Hz to 3979 Hz |
 | `set_ui_filter_order(a, g)`, `set_ui_filter_bw(a, g)` | the order (1st to 3rd) and the bandwidth code of the UI filters |
 | `temp_read()` | `Thermometer`: the die temperature |
 | `device_id()` | `Identifiable`: WHO_AM_I, 0x47 |
-| `fifo_begin(n, with_gyro)`, `fifo_end()` | turn the FIFO on in stream mode with the watermark at `n` packets, and off |
+| `accel_fifo_config(mode, n)`, `accel_fifo_watermark_reached()`, `fifo_end()` | turn the FIFO on in stream or stop-on-full mode with the watermark at `n` packets (1 to 32), whether the count has reached it, and the FIFO off |
 | `accel_fifo_count()`, `accel_fifo_read(dst)`, `fifo_take_imu(accel, gyro)` | the FIFO: the packet count, the accelerometer's samples, and both sensors' |
 | `route_int1(mask)`, `route_int2(mask)`, `configure_pins(active_low, open_drain)`, `set_int_timing(fast)`, `status()` | the interrupt pins and INT_STATUS |
 | `accel_test()`, `gyro_test()` | the change in milli-g and in milli-degrees per second that each self-test makes |
@@ -210,15 +215,20 @@ and `spi_write`, generic over `I2cBus` and `SpiBus`.
 ### The FIFO
 
 The FIFO is an option. It is 2 KB (§ 6.3) and `begin` leaves it off.
-`fifo_begin` puts it in stream mode, which overwrites the oldest packet
-when it is full, batches the accelerometer, and the gyroscope too when
-asked, and puts the watermark on INT1 in place of the data-ready flag. The
+`accel_fifo_config` puts it in stream mode (`AccelFifoStream`), which
+overwrites the oldest packet when it is full, or in stop-on-full mode
+(`AccelFifoStop`), which keeps the oldest. It batches the accelerometer, and
+the gyroscope too when the gyroscope is running, and puts the watermark on
+INT1 in place of the data-ready flag. `AccelFifoOff` is `fifo_end`. The
 packets are the 16-bit ones of § 6.1: 16 bytes when both sensors are
 batched (a header, the accelerometer's six bytes, the gyroscope's six, the
 temperature byte and a 16-bit timestamp), and 8 bytes for one sensor (a
 header, six bytes and the temperature byte). The count is in packets
-(FIFO_COUNT_REC), the watermark is in packets, and the watermark is limited
-to 127 packets for 16-byte ones and 255 for 8-byte ones. The reading takes
+(FIFO_COUNT_REC) and the watermark is in packets, 1 to 32 through the trait; the
+module's `fifo_start` takes up to 127 packets for 16-byte ones and 255 for
+8-byte ones. `accel_fifo_watermark_reached` compares the count with the
+watermark registers, because FIFO_THS_INT is in INT_STATUS, whose read clears
+the data-ready flag with it. The reading takes
 one packet per transaction from FIFO_DATA and decodes its header: bit 7 set
 is an empty FIFO, bits 6 and 5 say which sensors the packet holds, and bit
 4 marks the 20-bit packet, which is not read.
@@ -241,17 +251,18 @@ and not put in a list.
    (§ 14.34). A reading of -32768 on any axis is no sample, so
    `accel_read`, `gyro_read`, `imu_read` and `temp_read` answer `None`.
 3. After a change of mode, wait 200 µs before the next write (§ 14.36).
-   The functions that change a mode wait through the board's timer. The
+   The functions that change a mode wait through the bus's `delay_us`. The
    gyroscope has to stay on for 45 ms after it is turned on before it is
    turned off; the driver does not track that.
-4. Reading INT_STATUS clears its flags. `accel_ready` and `gyro_ready`
-   read the one DATA_RDY_INT flag, so the second of two calls in a row
-   answers `false` until the next sample. A program that wants both reads
-   `status()` once. A program that polls for FIFO flags with `status()`
+4. Reading INT_STATUS clears its flags. `accel_ready`, `gyro_ready` and
+   `imu_ready` read the one DATA_RDY_INT flag, so the second of two calls in
+   a row answers `false` until the next sample. A program that reads both
+   sensors polls `imu_ready` once and reads `imu_read` (`dev_imu.imu_poll`
+   does so). A program that polls for FIFO flags with `status()`
    loses the data-ready flag the same way.
 5. The accelerometer in low-noise mode does not run rates below 12.5 Hz,
    and in low-power mode it does not run rates above 500 Hz (§ 12.1);
-   `set_accel_mode` moves the rate to the nearest rate of the new mode. The
+   `accel_set_mode` moves the rate to the nearest rate of the new mode. The
    anti-alias and notch filters work in low-noise mode only (§ 12.4).
 6. The rates in whole hertz are rounded to the nearest, so 12.5 Hz reads
    as 13 and 1.5625 Hz as 2. Use the thousandths of a hertz for the exact
@@ -351,12 +362,27 @@ is kept:
   ms after the rates (accelerometer 10 ms, gyroscope 30 ms); so does
   `begin`.
 - Zephyr switches the interrupt sources off, puts the FIFO in bypass and
-  flushes it before it configures; so does `fifo_begin`.
+  flushes it before it configures; so does `accel_fifo_config`.
 - The data sheet asks INT_ASYNC_RESET to be cleared (§ 12.6) and gives the
   I2C and SPI settings (§ 12.3); `begin` follows both.
 - The data sheet's use note § 12.1 on the accelerometer's mode changes, and
   the invalid sample of § 14.34, which `icm426xx` and Zephyr's decoder
-  also handle, are kept by `set_accel_mode` and by the readers.
+  also handle, are kept by `accel_set_mode` and by the readers.
+
+## Where the traits fall short
+
+- `AccelerometerAsync`, `GyroscopeAsync` and the other async forms are not
+  implemented: `async fn` is refused at the embedded tier, and a `@value`
+  driver cannot implement them. The part completes nothing in the background
+  that a task would wait for.
+- A trait method gets a plain `self`, so the driver keeps no state between
+  calls; the full scales and the modes are read from the part in the
+  transaction before each sample.
+- `ImuControl` has one rate, and the part has two: `imu_set_rate_hz` sets both
+  sensors and answers the accelerometer's, and an accelerometer in low-power
+  mode can run slower than the gyroscope.
+- `Accelerometer.accel_fifo_config` takes no choice of sensors, so the
+  gyroscope is batched whenever it is running. The 20-bit packet is not read.
 
 ## Licence
 

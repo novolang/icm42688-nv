@@ -12,11 +12,11 @@
 // is 3, the bytes the controller clocked out, -1.
 
 use std.test
-use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, BoardTimer, I2cBus, SpiBus, GpioOut }
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_accel.{ AccelMilliG, AccelRange, AccelFifoMode, AccelMode, Accelerometer }
 use dev_gyro.{ GyroMilliDps, GyroRange, Gyroscope }
-use dev_imu.{ ImuSample, Imu }
+use dev_imu.{ ImuSample, Imu, ImuControl }
 use dev_thermo.{ TempMilliC, Thermometer }
 use dev_id.{ DeviceId, Identifiable }
 use icm42688
@@ -887,13 +887,21 @@ fn test_the_gyroscope_range_codes_and_the_ranges_below_250_dps() [io, hw]
     test.assert(icm42688.gyro_range_of(0x26) == GyroRange1000dps)
     test.assert(icm42688.gyro_range_of(0x46) == GyroRange500dps)
     test.assert(icm42688.gyro_range_of(0x66) == GyroRange250dps)
-    // ±125, ±62.5, ±31.25 and ±15.625 dps read as the narrowest value.
-    test.assert(icm42688.gyro_range_of(0x86) == GyroRange250dps)
-    test.assert(icm42688.gyro_range_of(0xE6) == GyroRange250dps)
+    // ±125, ±62.5, ±31.25 and ±15.625 dps are the codes 4 to 7.
+    test.assert(icm42688.gyro_range_of(0x86) == GyroRange125dps)
+    test.assert(icm42688.gyro_range_of(0xA6) == GyroRange62dps)
+    test.assert(icm42688.gyro_range_of(0xC6) == GyroRange31dps)
+    test.assert(icm42688.gyro_range_of(0xE6) == GyroRange15dps)
     test.assert_eq(icm42688.gyro_fs_of(GyroRange2000dps), 0)
     test.assert_eq(icm42688.gyro_fs_of(GyroRange1000dps), 1)
     test.assert_eq(icm42688.gyro_fs_of(GyroRange500dps), 2)
     test.assert_eq(icm42688.gyro_fs_of(GyroRange250dps), 3)
+    test.assert_eq(icm42688.gyro_fs_of(GyroRange125dps), 4)
+    test.assert_eq(icm42688.gyro_fs_of(GyroRange62dps), 5)
+    test.assert_eq(icm42688.gyro_fs_of(GyroRange31dps), 6)
+    test.assert_eq(icm42688.gyro_fs_of(GyroRange15dps), 7)
+    // The part has no range of ±4000 dps.
+    test.assert_eq(icm42688.gyro_fs_of(GyroRange4000dps), -1)
 
 @test
 fn test_the_sensitivities_are_table_1s_and_2s() [io, hw]
@@ -1159,17 +1167,25 @@ fn test_a_range_is_changed_without_touching_the_rate() [io, hw]
     test.assert(icm42688.gyro_range_read(d) == GyroRange500dps)
 
 @test
-fn test_the_gyroscope_codes_below_250_dps_are_set_by_code() [io, hw]
+fn test_the_gyroscope_ranges_below_250_dps_are_set_as_ranges() [io, hw]
     let c = chip()
     let d = i2c_dut(c)
-    test.assert(icm42688.gyro_fs_code_write(d, 4))
+    test.assert(icm42688.gyro_range_write(d, GyroRange125dps))
     test.assert_eq(reg_of(c, 0x4F), 0x86)
-    test.assert(icm42688.gyro_fs_code_write(d, 7))
+    test.assert(icm42688.gyro_range_read(d) == GyroRange125dps)
+    test.assert(icm42688.gyro_range_write(d, GyroRange62dps))
+    test.assert_eq(reg_of(c, 0x4F), 0xA6)
+    test.assert(icm42688.gyro_range_write(d, GyroRange31dps))
+    test.assert_eq(reg_of(c, 0x4F), 0xC6)
+    test.assert(icm42688.gyro_range_write(d, GyroRange15dps))
     test.assert_eq(reg_of(c, 0x4F), 0xE6)
-    test.assert(icm42688.gyro_range_read(d) == GyroRange250dps)
-    test.assert(not icm42688.gyro_fs_code_write(d, 8))
-    test.assert(not icm42688.gyro_fs_code_write(d, -1))
+    test.assert(icm42688.gyro_range_read(d) == GyroRange15dps)
+    // The part tops out at ±2000 dps: ±4000 is refused and the register stays.
+    test.assert(not icm42688.gyro_range_write(d, GyroRange4000dps))
     test.assert_eq(reg_of(c, 0x4F), 0xE6)
+    // Through the trait the same.
+    test.assert(icm42688.gyro_range_write(d, GyroRange500dps))
+    test.assert(icm42688.gyro_range_read(d) == GyroRange500dps)
 
 @test
 fn test_the_range_setters_answer_false_for_a_silent_part() [io, hw]
@@ -1178,7 +1194,7 @@ fn test_the_range_setters_answer_false_for_a_silent_part() [io, hw]
     let d = i2c_dut(c)
     test.assert(not icm42688.accel_range_write(d, AccelRange4g))
     test.assert(not icm42688.gyro_range_write(d, GyroRange500dps))
-    test.assert(not icm42688.gyro_fs_code_write(d, 5))
+    test.assert(not icm42688.gyro_range_write(d, GyroRange62dps))
     test.assert(icm42688.accel_range_read(d) == AccelRange2g)
     test.assert(icm42688.gyro_range_read(d) == GyroRange250dps)
 
@@ -1305,6 +1321,25 @@ fn test_the_accelerometer_mode_is_read_and_written_with_a_wait() [io, hw]
     test.assert_eq(reg_of(c, 0x4E), 0x2F)
 
 @test
+fn test_the_trait_modes_are_low_power_and_low_noise() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // Off after a reset: no mode.
+    test.assert(icm42688.accel_mode_of(d) == None)
+    test.assert(icm42688.accel_mode_set(d, AccelMode.AccelNormal))
+    test.assert(icm42688.accel_mode_of(d) == Some(AccelMode.AccelNormal))
+    test.assert(icm42688.accel_mode_read(d) == Icm42688Mode.Icm42688LowNoise)
+    test.assert(icm42688.accel_mode_set(d, AccelMode.AccelLowPower))
+    test.assert(icm42688.accel_mode_of(d) == Some(AccelMode.AccelLowPower))
+    // High resolution is the part's lowest-noise mode, low noise.
+    test.assert(icm42688.accel_mode_set(d, AccelMode.AccelHighResolution))
+    test.assert(icm42688.accel_mode_read(d) == Icm42688Mode.Icm42688LowNoise)
+    // A part that does not answer has no mode and takes none.
+    c.st.insert(4, 0)
+    test.assert(icm42688.accel_mode_of(d) == None)
+    test.assert(not icm42688.accel_mode_set(d, AccelMode.AccelLowPower))
+
+@test
 fn test_a_change_of_mode_moves_a_rate_the_new_mode_does_not_run() [io, hw]
     // § 12.1: low power to low noise below 12.5 Hz raises the rate to 12.5 Hz;
     // low noise to low power above 500 Hz lowers it to 500 Hz.
@@ -1347,6 +1382,90 @@ fn test_the_gyroscope_mode_is_read_and_written_with_a_wait() [io, hw]
     test.assert(not icm42688.gyro_mode_write(d, Icm42688Mode.Icm42688LowNoise))
     test.assert(icm42688.gyro_mode_read(d) == Icm42688Mode.Icm42688Off)
     test.assert(icm42688.accel_mode_read(d) == Icm42688Mode.Icm42688Off)
+
+@test
+fn test_imu_control_reads_the_flag_once_and_sets_the_rate_of_both_sensors() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // The flag clears on read: the second poll finds nothing.
+    test.assert(not icm42688.data_ready_of(d))
+    c.st.insert(41, 0x08)
+    test.assert(icm42688.data_ready_of(d))
+    test.assert(not icm42688.data_ready_of(d))
+    // Both sensors off after a reset: no rate.
+    test.assert_eq(icm42688.imu_rate_read(d), 0)
+    // Both come on in low-noise mode at the slowest rate at or above 50 Hz.
+    test.assert_eq(icm42688.imu_rate_write(d, 50), 50)
+    test.assert_eq(icm42688.imu_rate_read(d), 50)
+    test.assert_eq(icm42688.accel_rate_hz_read(d), 50)
+    test.assert_eq(icm42688.gyro_rate_hz_read(d), 50)
+    test.assert_eq(reg_of(c, 0x4E), 0x0F)
+    // A request of 0 is the slowest rate of low-noise mode, not off.
+    test.assert_eq(icm42688.imu_rate_write(d, 0), 13)
+    test.assert_eq(icm42688.imu_rate_read(d), 13)
+    // A request beyond the fastest rate takes the fastest.
+    test.assert_eq(icm42688.imu_rate_write(d, 100000), 32000)
+    // The accelerometer off: the rate is the gyroscope's.
+    test.assert(icm42688.accel_mode_write(d, Icm42688Mode.Icm42688Off))
+    test.assert_eq(icm42688.imu_rate_read(d), 32000)
+    // The accelerometer in low-power mode tops out at 500 Hz: the slower rate.
+    test.assert_eq(icm42688.accel_rate_write(d, 100000), 100000)
+    test.assert(icm42688.accel_mode_write(d, Icm42688Mode.Icm42688LowPower))
+    test.assert_eq(icm42688.imu_rate_write(d, 2000), 500)
+    // A part that refuses answers 0.
+    c.st.insert(4, 0)
+    test.assert_eq(icm42688.imu_rate_write(d, 100), 0)
+    test.assert_eq(icm42688.imu_rate_read(d), 0)
+
+@test
+fn test_imu_control_puts_the_sensors_in_standby_and_takes_them_out() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x4E, 0x0F)
+    // The gyroscope has a standby mode; the accelerometer's nearest is off.
+    test.assert(icm42688.imu_standby_write(d, true, true))
+    test.assert(icm42688.accel_mode_read(d) == Icm42688Mode.Icm42688Off)
+    test.assert(icm42688.gyro_mode_read(d) == Icm42688Mode.Icm42688Standby)
+    test.assert_eq(reg_of(c, 0x4E) & 0x0F, 0x04)
+    // Out of standby: low-noise mode for both.
+    test.assert(icm42688.imu_standby_write(d, false, false))
+    test.assert_eq(reg_of(c, 0x4E) & 0x0F, 0x0F)
+    // A sensor that is already running is left as it is, low power included.
+    c.regs.insert(0x4E, 0x0E)
+    log_clear(c)
+    test.assert(icm42688.imu_standby_write(d, false, false))
+    test.assert(icm42688.accel_mode_read(d) == Icm42688Mode.Icm42688LowPower)
+    test.assert(icm42688.gyro_mode_read(d) == Icm42688Mode.Icm42688LowNoise)
+    test.assert_eq(written(c).len(), 0)
+    // One at a time.
+    test.assert(icm42688.imu_standby_write(d, true, false))
+    test.assert_eq(reg_of(c, 0x4E) & 0x0F, 0x0C)
+    test.assert(icm42688.imu_standby_write(d, false, true))
+    test.assert_eq(reg_of(c, 0x4E) & 0x0F, 0x07)
+    // Standby for a sensor already in it, and out for one already running,
+    // write nothing.
+    log_clear(c)
+    test.assert(icm42688.imu_standby_write(d, false, true))
+    test.assert_eq(written(c).len(), 0)
+    // A refusal of the accelerometer's write fails the call.
+    let e = chip()
+    e.regs.insert(0x4E, 0x0F)
+    test.assert(not icm42688.imu_standby_write(flaky_write(e, 0x4E, 1), true, false))
+    // A refusal of the gyroscope's.
+    let f = chip()
+    f.regs.insert(0x4E, 0x0F)
+    test.assert(not icm42688.imu_standby_write(flaky_write(f, 0x4E, 1), false, true))
+    // An accelerometer refusal stops the gyroscope's change too.
+    let g = chip()
+    g.regs.insert(0x4E, 0x0F)
+    test.assert(not icm42688.imu_standby_write(flaky_write(g, 0x4E, 1), true, true))
+    test.assert_eq(reg_of(g, 0x4E) & 0x0C, 0x0C)
+    // Taking the accelerometer out of standby fails when the write fails.
+    let h = chip()
+    test.assert(not icm42688.imu_standby_write(flaky_write(h, 0x4E, 1), false, false))
+    // A part that does not answer.
+    c.st.insert(4, 0)
+    test.assert(not icm42688.imu_standby_write(d, true, true))
 
 @test
 fn test_the_temperature_sensor_is_switched_by_temp_dis() [io, hw]
@@ -1554,6 +1673,67 @@ fn test_the_watermark_is_limited_to_what_the_fifo_holds() [io, hw]
     test.assert_eq(reg_of(c, 0x60), 255)
     test.assert_eq(reg_of(c, 0x61), 0)
     test.assert(icm42688.fifo_start(d, 5, true))
+
+@test
+fn test_the_trait_configures_the_fifo_in_stream_or_stop_mode() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // Both sensors running after a start: the packet carries both.
+    c.regs.insert(0x4E, 0x0F)
+    test.assert(icm42688.fifo_configure(d, AccelFifoMode.AccelFifoStream, 20))
+    test.assert_eq(reg_of(c, 0x16), 0x40)
+    test.assert_eq(reg_of(c, 0x5F), 0x47)
+    test.assert_eq(reg_of(c, 0x60), 20)
+    test.assert_eq(reg_of(c, 0x65), 0x14)
+    // The stop-on-full mode is FIFO_MODE 10.
+    test.assert(icm42688.fifo_configure(d, AccelFifoMode.AccelFifoStop, 32))
+    test.assert_eq(reg_of(c, 0x16), 0x80)
+    test.assert_eq(reg_of(c, 0x60), 32)
+    // The gyroscope in standby is not batched.
+    c.regs.insert(0x4E, 0x07)
+    test.assert(icm42688.fifo_configure(d, AccelFifoMode.AccelFifoStream, 4))
+    test.assert_eq(reg_of(c, 0x5F), 0x45)
+    test.assert_eq(reg_of(c, 0x60), 4)
+    // Off bypasses the FIFO and puts the data-ready route back.
+    test.assert(icm42688.fifo_configure(d, AccelFifoMode.AccelFifoOff, 0))
+    test.assert_eq(reg_of(c, 0x16), 0)
+    test.assert_eq(reg_of(c, 0x5F), 0)
+    test.assert_eq(reg_of(c, 0x65), 0x18)
+    // A watermark outside 1 to 32 is refused and nothing is written.
+    log_clear(c)
+    test.assert(not icm42688.fifo_configure(d, AccelFifoMode.AccelFifoStream, 0))
+    test.assert(not icm42688.fifo_configure(d, AccelFifoMode.AccelFifoStop, 33))
+    log_is(c, [])
+    // A part that does not answer takes nothing.
+    c.st.insert(4, 0)
+    test.assert(not icm42688.fifo_configure(d, AccelFifoMode.AccelFifoStream, 8))
+
+@test
+fn test_the_fifo_watermark_is_reached_when_the_count_gets_to_it() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // No watermark set: never reached.
+    test.assert(not icm42688.fifo_watermark_reached(d))
+    c.regs.insert(0x4E, 0x0F)
+    test.assert(icm42688.fifo_configure(d, AccelFifoMode.AccelFifoStream, 2))
+    test.assert(not icm42688.fifo_watermark_reached(d))
+    fifo_both(c, 1, 2, 3, 4, 5, 6)
+    test.assert(not icm42688.fifo_watermark_reached(d))
+    fifo_both(c, 1, 2, 3, 4, 5, 6)
+    test.assert(icm42688.fifo_watermark_reached(d))
+    fifo_both(c, 1, 2, 3, 4, 5, 6)
+    test.assert(icm42688.fifo_watermark_reached(d))
+    // The watermark's high bits count: 0x105 packets.
+    c.regs.insert(0x61, 0x01)
+    c.regs.insert(0x60, 0x05)
+    test.assert(not icm42688.fifo_watermark_reached(d))
+    // The data-ready flag in INT_STATUS is left alone.
+    c.st.insert(41, 0x08)
+    test.assert(not icm42688.fifo_watermark_reached(d))
+    test.assert(icm42688.data_ready_of(d))
+    // A part that does not answer has not reached it.
+    c.st.insert(4, 0)
+    test.assert(not icm42688.fifo_watermark_reached(d))
 
 @test
 fn test_a_fifo_start_that_a_register_refuses_fails() [io, hw]
@@ -1948,6 +2128,7 @@ fn test_begin_over_spi_refuses_a_write_the_part_does_not_take() [io, hw]
 fn test_the_i2c_type_over_absent_hardware() [io, hw]
     let w = dev_bus.wiring_i2c(0, 0x68)
     let p = Icm42688.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, w)
+    p.wait_us(10)
     test.assert(not p.begin())
     test.assert(p.reg(0x75) == None)
     test.assert(not p.set_reg(0x4E, 1))
@@ -1955,12 +2136,12 @@ fn test_the_i2c_type_over_absent_hardware() [io, hw]
     test.assert(not p.set_bank_reg(1, 0x7C, 0x13, 0x10))
     test.assert_eq(p.gyro_set_rate_hz(100), 0)
     test.assert_eq(p.accel_rate_mhz(), -1)
-    test.assert_eq(p.set_accel_rate_mhz(100000), -1)
+    test.assert_eq(p.accel_set_rate_mhz(100000), -1)
     test.assert_eq(p.gyro_rate_mhz(), -1)
     test.assert_eq(p.set_gyro_rate_mhz(100000), -1)
-    test.assert(not p.gyro_set_fs_code(5))
-    test.assert(p.accel_mode() == Icm42688Mode.Icm42688Off)
-    test.assert(not p.set_accel_mode(Icm42688Mode.Icm42688LowNoise))
+    test.assert(not p.gyro_set_range(GyroRange62dps))
+    test.assert(p.accel_mode() == None)
+    test.assert(not p.accel_set_mode(AccelMode.AccelNormal))
     test.assert(p.gyro_mode() == Icm42688Mode.Icm42688Off)
     test.assert(not p.set_gyro_mode(Icm42688Mode.Icm42688LowNoise))
     test.assert(not p.set_temp_enabled(false))
@@ -1975,7 +2156,8 @@ fn test_the_i2c_type_over_absent_hardware() [io, hw]
     test.assert(not p.configure_pins(true, false))
     test.assert(not p.set_int_timing(true))
     test.assert(p.status() == None)
-    test.assert(not p.fifo_begin(10, true))
+    test.assert(not p.accel_fifo_config(AccelFifoMode.AccelFifoStream, 10))
+    test.assert(not p.accel_fifo_watermark_reached())
     test.assert(not p.fifo_end())
     var a: Vec[AccelMilliG; 32] = Vec.new()
     var g: Vec[GyroMilliDps; 32] = Vec.new()
@@ -1998,6 +2180,10 @@ fn test_the_i2c_type_over_absent_hardware() [io, hw]
     test.assert(not p.gyro_set_range(GyroRange500dps))
     test.assert_eq(p.gyro_rate_hz(), 0)
     test.assert(p.imu_read() == None)
+    test.assert(not p.imu_ready())
+    test.assert_eq(p.imu_set_rate_hz(100), 0)
+    test.assert_eq(p.imu_rate_hz(), 0)
+    test.assert(not p.imu_standby(true, false))
     test.assert_eq(p.temp_start(), 0)
     test.assert(p.temp_read() == None)
     test.assert(p.device_id() == None)
@@ -2015,12 +2201,12 @@ fn test_the_spi_type_over_absent_hardware() [io, hw]
     test.assert(not p.set_bank_reg(1, 0x7C, 0x13, 0x10))
     test.assert_eq(p.gyro_set_rate_hz(100), 0)
     test.assert_eq(p.accel_rate_mhz(), -1)
-    test.assert_eq(p.set_accel_rate_mhz(100000), -1)
+    test.assert_eq(p.accel_set_rate_mhz(100000), -1)
     test.assert_eq(p.gyro_rate_mhz(), -1)
     test.assert_eq(p.set_gyro_rate_mhz(100000), -1)
-    test.assert(not p.gyro_set_fs_code(5))
-    test.assert(p.accel_mode() == Icm42688Mode.Icm42688Off)
-    test.assert(not p.set_accel_mode(Icm42688Mode.Icm42688LowNoise))
+    test.assert(not p.gyro_set_range(GyroRange62dps))
+    test.assert(p.accel_mode() == None)
+    test.assert(not p.accel_set_mode(AccelMode.AccelNormal))
     test.assert(p.gyro_mode() == Icm42688Mode.Icm42688Off)
     test.assert(not p.set_gyro_mode(Icm42688Mode.Icm42688LowNoise))
     test.assert(not p.set_temp_enabled(false))
@@ -2035,7 +2221,8 @@ fn test_the_spi_type_over_absent_hardware() [io, hw]
     test.assert(not p.configure_pins(true, false))
     test.assert(not p.set_int_timing(true))
     test.assert(p.status() == None)
-    test.assert(not p.fifo_begin(10, true))
+    test.assert(not p.accel_fifo_config(AccelFifoMode.AccelFifoStream, 10))
+    test.assert(not p.accel_fifo_watermark_reached())
     test.assert(not p.fifo_end())
     var a: Vec[AccelMilliG; 32] = Vec.new()
     var g: Vec[GyroMilliDps; 32] = Vec.new()
@@ -2058,6 +2245,10 @@ fn test_the_spi_type_over_absent_hardware() [io, hw]
     test.assert(not p.gyro_set_range(GyroRange500dps))
     test.assert_eq(p.gyro_rate_hz(), 0)
     test.assert(p.imu_read() == None)
+    test.assert(not p.imu_ready())
+    test.assert_eq(p.imu_set_rate_hz(100), 0)
+    test.assert_eq(p.imu_rate_hz(), 0)
+    test.assert(not p.imu_standby(true, false))
     test.assert_eq(p.temp_start(), 0)
     test.assert(p.temp_read() == None)
     test.assert(p.device_id() == None)

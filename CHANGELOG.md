@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
+are path dependencies until they are published.
+
+- `ImuControl` is implemented for `Icm42688` and `Icm42688Spi`: `imu_ready`
+  reads the shared data-ready flag, `imu_set_rate_hz` and `imu_rate_hz` set and
+  read the rate of both sensors, and `imu_standby` puts either in standby (the
+  accelerometer, which has none, is turned off).
+- `Accelerometer.accel_fifo_config(mode, watermark)` and
+  `accel_fifo_watermark_reached` replace the inherent `fifo_begin`. Behaviour
+  change: the gyroscope is batched when it is running and not on request, and
+  the watermark is 1 to 32 packets and refused outside that (`fifo_begin`
+  limited it to what the FIFO holds). `AccelFifoStop` is new: the part's
+  stop-on-full mode. `icm42688.fifo_start` is unchanged.
+- `GyroRange125dps`, `GyroRange62dps`, `GyroRange31dps` and `GyroRange15dps`
+  replace the inherent `gyro_set_fs_code`: `gyro_set_range` takes them and
+  `gyro_range` answers them, where 0.1.0 answered `GyroRange250dps` for the
+  four narrow codes. `GyroRange4000dps` is refused. `gyro_fs_code_write` is
+  gone.
+- The inherent `accel_rate_mhz`, `set_accel_rate_mhz`, `accel_mode` and
+  `set_accel_mode` are the trait's `accel_rate_mhz`, `accel_set_rate_mhz`,
+  `accel_mode` and `accel_set_mode`, because an inherent method of the name of
+  a trait method breaks the build. `accel_mode` answers `?AccelMode`: `None`
+  while the accelerometer is off, `AccelLowPower` or `AccelNormal` otherwise.
+  `Icm42688Mode` and `accel_mode_read` and `accel_mode_write` stay.
+- The waits go through the bus's `delay_us`. The `timer` field of both types is
+  gone; `attach` is unchanged.
+
 ## 0.1.0
 
 The first release: a driver for TDK InvenSense's ICM-42688-P six-axis IMU
