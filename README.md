@@ -164,7 +164,7 @@ novo pkg add icm42688-nv
 
 | Module | What is in it |
 |---|---|
-| `icm42688` | The types `Icm42688` (I2C) and `Icm42688Spi` (SPI), `Icm42688Mode`, the trait `Icm42688Port`, the bus framing, the register access and the banks, the conversions, the rates and power modes, the filters, the FIFO, the self-tests and the bring-up |
+| `icm42688` | The types `Icm42688` (I2C) and `Icm42688Spi` (SPI), `Icm42688Mode`, the trait `Icm42688Port` over devices-nv's `RegPort`, the bus framing, the register access and the banks, the conversions, the rates and power modes, the filters, the FIFO, the self-tests and the bring-up |
 
 ## How to choose an entry point
 
@@ -207,7 +207,7 @@ sensors to start. It answers `false` for a part that does not answer 0x47
 and for a register that does not hold what was written.
 
 A program that holds its own bus, or a test with a double of the part,
-implements `Icm42688Port` over its bus and calls the module's functions,
+implements devices-nv's `RegPort` (`read_regs` and `write_reg`; the register reads and read-modify-writes, `port.read_reg(reg)` and `port.update_reg_verified(reg, mask, bits)`, are its methods) and `Icm42688Port` over its bus and calls the module's functions,
 which take the port: `icm42688.imu_read_of(port)`, `icm42688.start(port)`.
 The framing of each bus is `i2c_read_into`, `i2c_write`, `spi_read_into`
 and `spi_write`, generic over `I2cBus` and `SpiBus`.

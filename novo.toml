@@ -28,4 +28,4 @@ embedded-hal-nv = "^0.4.0"
 # The wiring record a board's device table hands `attach`, the register
 # helpers, and the Accelerometer, Gyroscope, Imu, Thermometer and
 # Identifiable traits.
-devices-nv      = "^0.4.0"
+devices-nv      = "^0.4.1"

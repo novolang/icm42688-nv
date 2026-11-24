@@ -13,7 +13,7 @@
 
 use std.test
 use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, RegPort }
 use dev_accel.{ AccelMilliG, AccelRange, AccelFifoMode, AccelMode, Accelerometer }
 use dev_gyro.{ GyroMilliDps, GyroRange, Gyroscope }
 use dev_imu.{ ImuSample, Imu, ImuControl }
@@ -378,11 +378,7 @@ struct I2cDut
     pins: FakePins
     w: DeviceWiring
 
-impl Icm42688Port for I2cDut
-    @tier(app)
-    fn setup(self) -> Bool [hw]
-        icm42688.i2c_setup(self.bus, self.pins, self.w)
-
+impl RegPort for I2cDut
     @tier(app)
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         icm42688.i2c_read_into(self.bus, self.w, reg, n, var dst)
@@ -390,6 +386,11 @@ impl Icm42688Port for I2cDut
     @tier(app)
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         icm42688.i2c_write(self.bus, self.w, reg, v)
+
+impl Icm42688Port for I2cDut
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        icm42688.i2c_setup(self.bus, self.pins, self.w)
 
     @tier(app)
     fn irq_level(self) -> Int [hw]
@@ -408,11 +409,7 @@ struct SpiDut
     pins: FakePins
     w: DeviceWiring
 
-impl Icm42688Port for SpiDut
-    @tier(app)
-    fn setup(self) -> Bool [hw]
-        icm42688.spi_setup(self.bus, self.pins, self.w)
-
+impl RegPort for SpiDut
     @tier(app)
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         icm42688.spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
@@ -420,6 +417,11 @@ impl Icm42688Port for SpiDut
     @tier(app)
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         icm42688.spi_write(self.bus, self.pins, self.w, reg, v)
+
+impl Icm42688Port for SpiDut
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        icm42688.spi_setup(self.bus, self.pins, self.w)
 
     @tier(app)
     fn irq_level(self) -> Int [hw]
@@ -447,11 +449,7 @@ struct Flaky
     rseen: HashMap<Int, Int>
     quiet: HashMap<Int, Int>
 
-impl Icm42688Port for Flaky
-    @tier(app)
-    fn setup(self) -> Bool [hw]
-        self.inner.setup()
-
+impl RegPort for Flaky
     @tier(app)
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         let k = at(self.rseen, reg) + 1
@@ -473,6 +471,11 @@ impl Icm42688Port for Flaky
         if at(self.fail, reg) == n
             return false
         self.inner.write_reg(reg, v)
+
+impl Icm42688Port for Flaky
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
 
     @tier(app)
     fn irq_level(self) -> Int [hw]
@@ -662,7 +665,7 @@ fn written(c: Chip) -> [Int]
 fn test_an_i2c_read_is_the_register_and_a_repeated_start_for_any_count() [io, hw]
     let c = chip()
     let d = i2c_dut(c)
-    test.assert_eq(icm42688.reg_read(d, 0x75) ?? -1, 0x47)
+    test.assert_eq(d.read_reg(0x75) ?? -1, 0x47)
     log_is(c, [2, 0x68, 0x75, 1, -1])
     c.regs.insert(0x2A, 11)
     c.regs.insert(0x2B, 22)
@@ -685,17 +688,17 @@ fn test_a_missing_i2c_part_does_not_answer() [io, hw]
     let c = chip()
     c.st.insert(4, 0)
     let d = i2c_dut(c)
-    test.assert(icm42688.reg_read(d, 0x75) == None)
+    test.assert(d.read_reg(0x75) == None)
     test.assert(not d.write_reg(0x4E, 1))
-    test.assert(not icm42688.reg_write(d, 0x4E, 1))
-    test.assert(not icm42688.reg_update(d, 0x4E, 1, 1))
+    test.assert(not d.write_reg_verified(0x4E, 1))
+    test.assert(not d.update_reg_verified(0x4E, 1, 1))
     test.assert(icm42688.id_read(d) == None)
 
 @test
 fn test_an_spi_read_sets_rw_and_carries_no_dummy_byte() [io, hw]
     let c = chip()
     let d = spi_dut(c)
-    test.assert_eq(icm42688.reg_read(d, 0x75) ?? -1, 0x47)
+    test.assert_eq(d.read_reg(0x75) ?? -1, 0x47)
     log_is(c, [3, 0xF5, 0xFF, -1])
     test.assert_eq(at(d.pins.levels, 67), 1)
     c.regs.insert(0x2A, 11)
@@ -719,7 +722,7 @@ fn test_an_spi_part_that_is_not_there_reads_0xff_and_is_no_part() [io, hw]
     let c = chip()
     c.st.insert(4, 0)
     let d = spi_dut(c)
-    test.assert_eq(icm42688.reg_read(d, 0x75) ?? -1, 0xFF)
+    test.assert_eq(d.read_reg(0x75) ?? -1, 0xFF)
     test.assert(icm42688.id_read(d) == None)
     c.st.insert(4, 1)
     c.regs.insert(0x75, 0)
@@ -833,7 +836,7 @@ fn test_a_register_of_bank_1_is_read_and_bank_0_is_put_back() [io, hw]
     test.assert_eq(icm42688.bank_read(d, 1, 0x7C) ?? -1, 0x5F)
     test.assert_eq(bank_of(c), 0)
     // Bank 0's register at the same address is another.
-    test.assert_eq(icm42688.reg_read(d, 0x7C) ?? -1, 0)
+    test.assert_eq(d.read_reg(0x7C) ?? -1, 0)
 
 @test
 fn test_a_visit_to_a_bank_puts_bank_0_back_also_when_it_failed() [io, hw]
@@ -1813,7 +1816,7 @@ fn test_a_fifo_of_one_sensor_has_8_byte_packets() [io, hw]
     test.assert_eq(g.len(), 0)
     test.assert_eq(a[1].y, 2000)
     // The gyroscope's own packet (header 0x20) goes to its list.
-    test.assert(icm42688.reg_write(d, 0x5F, 0x42))
+    test.assert(d.write_reg_verified(0x5F, 0x42))
     fifo_one(c, 0x20, 164, 0, 0)
     test.assert_eq(icm42688.fifo_read_imu(d, var a, var g), 1)
     test.assert_eq(g.len(), 1)
@@ -2253,3 +2256,13 @@ fn test_the_spi_type_over_absent_hardware() [io, hw]
     test.assert(p.temp_read() == None)
     test.assert(p.device_id() == None)
     test.assert(not p.device_probe(0x47))
+
+// ── The functions that the register methods replace ──────────────────
+
+@test
+fn test_the_deprecated_register_functions_answer_as_the_methods_do() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(icm42688.reg_read(d, 0x75), d.read_reg(0x75))
+    test.assert_eq(icm42688.reg_write(d, 0x75, 0x01), d.write_reg_verified(0x75, 0x01))
+    test.assert_eq(icm42688.reg_update(d, 0x75, 0x0F, 0x01), d.update_reg_verified(0x75, 0x0F, 0x01))
