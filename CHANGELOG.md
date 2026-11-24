@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 — 2026-11-24
+## 0.3.0 — 2026-11-24
 
 The register reads and writes, and the bus set-up, are devices-nv's `RegPort` and `wiring_*` functions, and `Icm42688Port` is smaller by them.  The release depends on devices-nv 0.4.1.
 

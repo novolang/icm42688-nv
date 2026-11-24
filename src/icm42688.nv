@@ -267,7 +267,7 @@ pub fn spi_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: I
 
 // Makes an I2C bus ready: the INT1 pin an input, the bus at 400 kHz.
 // Answers whether the wiring has an address.
-pub @deprecated(since = "0.2.0", replace_with = "dev_bus.wiring_i2c_setup")
+pub @deprecated(since = "0.3.0", replace_with = "dev_bus.wiring_i2c_setup")
 fn i2c_setup<B: I2cBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
     dev_bus.wiring_i2c_setup(bus, gpio, w, I2C_HZ)
 
@@ -275,13 +275,13 @@ fn i2c_setup<B: I2cBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [h
 // drives low before it is an output, then an output; the INT1 pin an
 // input; the bus at 4 MHz in mode 3.  Answers whether the wiring has a
 // chip select.
-pub @deprecated(since = "0.2.0", replace_with = "dev_bus.wiring_spi_setup")
+pub @deprecated(since = "0.3.0", replace_with = "dev_bus.wiring_spi_setup")
 fn spi_setup<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
     dev_bus.wiring_spi_setup(bus, gpio, w, SPI_HZ, SPI_MODE)
 
 // The level of the part's INT1 line on the board, 1 or 0, or -1 for a
 // wiring with no interrupt pin.
-pub @deprecated(since = "0.2.0", replace_with = "dev_bus.wiring_irq_level")
+pub @deprecated(since = "0.3.0", replace_with = "dev_bus.wiring_irq_level")
 fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
     dev_bus.wiring_irq_level(gpio, w)
 
@@ -289,14 +289,14 @@ fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
 
 // One register of the bank the part is in, or `None` when the part did
 // not answer.
-pub @deprecated(since = "0.2.0", replace_with = "RegPort.read_reg")
+pub @deprecated(since = "0.3.0", replace_with = "RegPort.read_reg")
 fn reg_read<P: Icm42688Port>(p: P, reg: Int) -> ?Int [hw]
     p.read_reg(reg)
 
 // Writes `v` to the register `reg` and reads it back: whether the part
 // holds the value.  A register with a bit that clears itself is written
 // with `write_reg`.
-pub @deprecated(since = "0.2.0", replace_with = "RegPort.write_reg_verified")
+pub @deprecated(since = "0.3.0", replace_with = "RegPort.write_reg_verified")
 fn reg_write<P: Icm42688Port>(p: P, reg: Int, v: Int) -> Bool [hw]
     p.write_reg_verified(reg, v)
 
@@ -306,7 +306,7 @@ fn reg_write<P: Icm42688Port>(p: P, reg: Int, v: Int) -> Bool [hw]
 // Fix kept: several registers hold reserved bits that the data sheet gives
 // a reset value (INTF_CONFIG1 is 0x91, GYRO_CONFIG1 0x16), so a
 // whole-register write would change what it should not.
-pub @deprecated(since = "0.2.0", replace_with = "RegPort.update_reg_verified")
+pub @deprecated(since = "0.3.0", replace_with = "RegPort.update_reg_verified")
 fn reg_update<P: Icm42688Port>(p: P, reg: Int, mask: Int, v: Int) -> Bool [hw]
     p.update_reg_verified(reg, mask, v)
 
